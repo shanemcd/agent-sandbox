@@ -3838,6 +3838,12 @@ spec:
                 required:
                 - spec
                 type: object
+              runtimeBackend:
+                default: Pod
+                enum:
+                - Pod
+                - VirtualMachine
+                type: string
               service:
                 type: boolean
               shutdownPolicy:

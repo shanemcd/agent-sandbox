@@ -29,7 +29,9 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -93,6 +95,11 @@ func PodCacheTransform(obj any) (any, error) {
 	pod.Finalizers = nil
 	pod.Spec = corev1.PodSpec{NodeName: pod.Spec.NodeName}
 	return pod, nil
+}
+
+// KubeVirt GroupVersionKind for unstructured access.
+var kubevirtVMGVK = schema.GroupVersionKind{
+	Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachine",
 }
 
 // resourceOwnership represents the ownership state of a Kubernetes resource relative to a Sandbox.
@@ -287,25 +294,32 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 
 	var allErrors error
 
-	// Reconcile PVCs from volumeClaimTemplates
+	// Reconcile PVCs from volumeClaimTemplates (common to both backends)
 	err := r.reconcilePVCs(ctx, sandbox, nameHash)
 	allErrors = errors.Join(allErrors, err)
 
-	// Reconcile Pod
-	pod, podErr := r.reconcilePod(ctx, sandbox, nameHash)
-	allErrors = errors.Join(allErrors, podErr)
-
-	if pod == nil {
-		sandbox.Status.PodIPs = nil
-		sandbox.Status.NodeName = ""
+	// Branch based on runtime backend
+	var pod *corev1.Pod
+	var podErr error
+	if sandbox.Spec.RuntimeBackend == sandboxv1beta1.RuntimeBackendVirtualMachine {
+		err = r.reconcileVirtualMachine(ctx, sandbox, nameHash)
+		allErrors = errors.Join(allErrors, err)
 	} else {
-		sandbox.Status.LabelSelector = sandboxLabel + "=" + nameHash
-		if isOwnedBySandbox(pod, sandbox) {
-			sandbox.Status.PodIPs = podIPsFromStatus(pod.Status.PodIPs)
-			sandbox.Status.NodeName = pod.Spec.NodeName
-		} else {
+		// Default: Pod backend
+		pod, podErr = r.reconcilePod(ctx, sandbox, nameHash)
+		allErrors = errors.Join(allErrors, podErr)
+		if pod == nil {
 			sandbox.Status.PodIPs = nil
 			sandbox.Status.NodeName = ""
+		} else {
+			sandbox.Status.LabelSelector = sandboxLabel + "=" + nameHash
+			if isOwnedBySandbox(pod, sandbox) {
+				sandbox.Status.PodIPs = podIPsFromStatus(pod.Status.PodIPs)
+				sandbox.Status.NodeName = pod.Spec.NodeName
+			} else {
+				sandbox.Status.PodIPs = nil
+				sandbox.Status.NodeName = ""
+			}
 		}
 	}
 
@@ -313,18 +327,19 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	svc, err := r.reconcileService(ctx, sandbox, nameHash)
 	allErrors = errors.Join(allErrors, err)
 
-	// compute and set overall conditions
-	conditions := r.computeConditions(sandbox, allErrors, svc, pod, podErr)
-	hasFinished := false
-	for _, condition := range conditions {
-		meta.SetStatusCondition(&sandbox.Status.Conditions, condition)
-		if condition.Type == string(sandboxv1beta1.SandboxConditionFinished) {
-			hasFinished = true
+	// Compute and set conditions (Pod backend only; VM backend sets its own)
+	if sandbox.Spec.RuntimeBackend != sandboxv1beta1.RuntimeBackendVirtualMachine {
+		conditions := r.computeConditions(sandbox, allErrors, svc, pod, podErr)
+		hasFinished := false
+		for _, condition := range conditions {
+			meta.SetStatusCondition(&sandbox.Status.Conditions, condition)
+			if condition.Type == string(sandboxv1beta1.SandboxConditionFinished) {
+				hasFinished = true
+			}
 		}
-	}
-
-	if !hasFinished {
-		meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
+		if !hasFinished {
+			meta.RemoveStatusCondition(&sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionFinished))
+		}
 	}
 
 	return allErrors
@@ -1240,6 +1255,531 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	return pod, nil
 }
 
+// ---------------------------------------------------------------------------
+// KubeVirt VirtualMachine backend
+// ---------------------------------------------------------------------------
+
+func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string) error {
+	logger := log.FromContext(ctx)
+	vmName := sandbox.Name
+	secretName := vmName + "-cloudinit"
+
+	// Handle suspend
+	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
+		return r.suspendVirtualMachine(ctx, sandbox, vmName)
+	}
+
+	// Check if VM exists
+	vm := &unstructured.Unstructured{}
+	vm.SetGroupVersionKind(kubevirtVMGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: vmName, Namespace: sandbox.Namespace}, vm)
+	if err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to get VirtualMachine: %w", err)
+		}
+		logger.Info("Creating VirtualMachine", "VM.Name", vmName)
+
+		if err := r.createCloudInitSecret(ctx, sandbox, secretName, nameHash); err != nil {
+			return err
+		}
+		if err := r.createVirtualMachine(ctx, sandbox, vmName, secretName, nameHash); err != nil {
+			return err
+		}
+
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1beta1.SandboxConditionReady),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             sandboxv1beta1.SandboxReasonDependenciesNotReady,
+			Message:            "VirtualMachine created, waiting for VMI to become Running",
+		})
+		return nil
+	}
+
+	// Ensure VM is running (resume from suspend)
+	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
+	if !running {
+		logger.Info("Resuming VirtualMachine", "VM.Name", vmName)
+		patch := client.MergeFrom(vm.DeepCopy())
+		unstructured.SetNestedField(vm.Object, true, "spec", "running")
+		if err := r.Patch(ctx, vm, patch); err != nil {
+			return fmt.Errorf("failed to patch VM running=true: %w", err)
+		}
+	}
+
+	return r.updateStatusFromVMI(ctx, sandbox, vmName)
+}
+
+func (r *SandboxReconciler) createCloudInitSecret(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, secretName, nameHash string) error {
+	logger := log.FromContext(ctx)
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      secretName,
+			Namespace: sandbox.Namespace,
+			Labels:    map[string]string{sandboxLabel: nameHash},
+		},
+		StringData: map[string]string{
+			"userdata": buildCloudInitUserdata(sandbox),
+		},
+	}
+
+	if err := ctrl.SetControllerReference(sandbox, secret, r.Scheme); err != nil {
+		return fmt.Errorf("SetControllerReference for cloud-init Secret: %w", err)
+	}
+	if err := r.Create(ctx, secret, client.FieldOwner(sandboxControllerFieldOwner)); err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to create cloud-init Secret: %w", err)
+	}
+	logger.Info("Created cloud-init Secret", "Secret.Name", secretName)
+	return nil
+}
+
+func buildCloudInitUserdata(sandbox *sandboxv1beta1.Sandbox) string {
+	const (
+		supervisorBinary = "/opt/openshell/bin/openshell-sandbox"
+		sandboxTokenPath = "/etc/openshell/auth/sandbox.jwt"
+		sshPort          = 22
+	)
+
+	// Build systemd Environment= lines from the sandbox spec environment
+	var envLines []string
+	envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_SANDBOX_ID=%s", sandbox.Name))
+	envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_SANDBOX=%s", sandbox.Name))
+	envLines = append(envLines, "Environment=OPENSHELL_LOG_LEVEL=info")
+	envLines = append(envLines, "Environment=OPENSHELL_SSH_SOCKET_PATH=/run/openshell/ssh.sock")
+	envLines = append(envLines, "Environment=OPENSHELL_SANDBOX_UID=10001")
+	envLines = append(envLines, "Environment=OPENSHELL_SANDBOX_GID=10001")
+
+	// Extract OPENSHELL_ENDPOINT, token, and optional sibling workload command.
+	// When OPENSHELL_SANDBOX_COMMAND is set, the supervisor runs network-only
+	// and a separate systemd unit enters the netns to run the command (VM
+	// sidecar topology used by NemoClaw/Hermes).
+	var sandboxToken string
+	var sandboxCommand string
+	for _, c := range sandbox.Spec.PodTemplate.Spec.Containers {
+		for _, e := range c.Env {
+			switch e.Name {
+			case "OPENSHELL_ENDPOINT":
+				envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_ENDPOINT=%s", e.Value))
+			case "OPENSHELL_SANDBOX_TOKEN":
+				sandboxToken = e.Value
+			case "OPENSHELL_SANDBOX_COMMAND":
+				sandboxCommand = e.Value
+			default:
+				envLines = append(envLines, fmt.Sprintf("Environment=%s=%s", e.Name, e.Value))
+			}
+		}
+	}
+
+	if sandboxToken != "" {
+		envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_SANDBOX_TOKEN_FILE=%s", sandboxTokenPath))
+	}
+
+	supervisorExec := supervisorBinary
+	if sandboxCommand != "" {
+		supervisorExec = supervisorBinary + " --mode=network"
+	}
+
+	envBlock := strings.Join(envLines, "\n      ")
+
+	// Build write_files entries
+	var writeFiles strings.Builder
+	fmt.Fprintf(&writeFiles, `  - path: /etc/openshell/sandbox-id
+    content: "%s"
+    permissions: "0644"
+`, sandbox.Name)
+
+	if sandboxToken != "" {
+		fmt.Fprintf(&writeFiles, `  - path: %s
+    content: "%s"
+    permissions: "0400"
+`, sandboxTokenPath, sandboxToken)
+	}
+
+	// Sibling workload unit: enter supervisor netns, load provider placeholders,
+	// publish entrypoint PID for proxy identity binding, then run the command.
+	// A wrapper script avoids systemd's $$ escaping and runs as root so
+	// NemoClaw can recover seals / apply root:sandbox 1775 posture before
+	// dropping privileges itself (same as the container entrypoint).
+	var enableWorkload string
+	if sandboxCommand != "" {
+		fmt.Fprintf(&writeFiles, `  - path: /etc/openshell/sandbox-workload-start
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      # Wait for sidecar coordination files. Source provider.env here (not only
+      # via systemd EnvironmentFile) so credential placeholders are present even
+      # if the unit started before the supervisor finished publishing them.
+      until [ -s /run/openshell/netns ] && [ -s /run/openshell/provider.env ]; do sleep 1; done
+      set -a
+      # shellcheck disable=SC1091
+      . /run/openshell/provider.env
+      set +a
+      # Locked NemoClaw posture: root:sandbox sticky. tmpfs overlays reset this.
+      chown root:sandbox /sandbox 2>/dev/null || true
+      chmod 1775 /sandbox 2>/dev/null || true
+      NS=$(cat /run/openshell/netns)
+      exec nsenter --net="$NS" /bin/bash -c 'echo $$ > /run/openshell/entrypoint.pid; exec %s'
+  - path: /etc/systemd/system/sandbox-workload.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Sandbox Workload (netns sibling)
+      After=openshell-sandbox.service
+      Requires=openshell-sandbox.service
+
+      [Service]
+      Type=simple
+      EnvironmentFile=-/run/openshell/provider.env
+      Environment=HOME=/sandbox
+      Environment=PATH=/opt/hermes/.venv/bin:/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      Environment=CARGO_HOME=/opt/rust/cargo
+      Environment=RUSTUP_HOME=/opt/rust/rustup
+      Environment=NEMOCLAW_CAPS_DROPPED=1
+      Environment=http_proxy=http://10.200.0.1:3128
+      Environment=https_proxy=http://10.200.0.1:3128
+      Environment=HTTP_PROXY=http://10.200.0.1:3128
+      Environment=HTTPS_PROXY=http://10.200.0.1:3128
+      Environment=no_proxy=localhost,127.0.0.1,::1
+      Environment=NO_PROXY=localhost,127.0.0.1,::1
+      Environment=SSL_CERT_FILE=/etc/openshell-tls/ca-bundle.pem
+      Environment=REQUESTS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem
+      Environment=CURL_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem
+      Environment=NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem
+      Environment=GIT_SSL_CAINFO=/etc/openshell-tls/ca-bundle.pem
+      ExecStart=/etc/openshell/sandbox-workload-start
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+`, sandboxCommand)
+		enableWorkload = "\n  - systemctl enable --now sandbox-workload.service"
+	}
+
+	// Collect SSH authorized keys from container env vars
+	var sshKeys []string
+	for _, c := range sandbox.Spec.PodTemplate.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name == "OPENSHELL_SSH_AUTHORIZED_KEY" {
+				sshKeys = append(sshKeys, e.Value)
+			}
+		}
+	}
+
+	// Build ssh_authorized_keys YAML
+	var sshKeysYAML string
+	if len(sshKeys) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\n    ssh_authorized_keys:\n")
+		for _, k := range sshKeys {
+			fmt.Fprintf(&sb, "    - %s\n", k)
+		}
+		sshKeysYAML = sb.String()
+	}
+
+	return fmt.Sprintf(`#cloud-config
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  users:
+  - name: sandbox
+    password: sandbox
+    type: text
+
+users:
+  - default
+  - name: sandbox
+    uid: "10001"
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false%s
+
+write_files:
+%s
+  - path: /etc/systemd/system/openshell-sandbox.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=OpenShell Sandbox Supervisor
+      After=network-online.target sshd.service
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      ExecStart=%s
+      Restart=on-failure
+      RestartSec=5
+      %s
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - sed -i 's/^#\?Port .*/Port %d/' /etc/ssh/sshd_config
+  - systemctl restart sshd || true
+  - mkdir -p /run/openshell
+  - |
+    # Make writable paths for bootc/ostree images where / is read-only.
+    # Copy image content into tmpfs overlays, preserving ownership.
+    for dir in /sandbox /opt/data; do
+      mkdir -p "$dir" 2>/dev/null || true
+      if ! touch "$dir/.write-test" 2>/dev/null; then
+        tmp=$(mktemp -d)
+        cp -a "$dir/." "$tmp/" 2>/dev/null || true
+        mount -t tmpfs tmpfs "$dir"
+        cp -a "$tmp/." "$dir/" 2>/dev/null || true
+        rm -rf "$tmp"
+      else
+        rm -f "$dir/.write-test"
+      fi
+    done
+    # NemoClaw locked posture after tmpfs remount (root:root looks like an orphaned seal).
+    chown root:sandbox /sandbox 2>/dev/null || true
+    chmod 1775 /sandbox 2>/dev/null || true
+    if [ -d /sandbox/.hermes ]; then
+      # bootc numeric UIDs from the Debian stage can remap to wrong Fedora names;
+      # normalize mutable trees to sandbox, then re-lock trust anchors.
+      chown -R sandbox:sandbox /sandbox/.hermes 2>/dev/null || true
+      chown root:root /sandbox/.hermes 2>/dev/null || true
+      chmod 755 /sandbox/.hermes 2>/dev/null || true
+      for f in config.yaml .config-hash SOUL.md; do
+        if [ -e "/sandbox/.hermes/$f" ]; then
+          chown root:root "/sandbox/.hermes/$f" 2>/dev/null || true
+          chmod 444 "/sandbox/.hermes/$f" 2>/dev/null || true
+        fi
+      done
+      if [ -e /sandbox/.hermes/.env ]; then
+        chown sandbox:sandbox /sandbox/.hermes/.env 2>/dev/null || true
+        chmod 640 /sandbox/.hermes/.env 2>/dev/null || true
+      fi
+    fi
+    mkdir -p /run/nemoclaw
+  - systemctl daemon-reload
+  - systemctl enable --now openshell-sandbox.service%s
+`, sshKeysYAML, writeFiles.String(), supervisorExec, envBlock, sshPort, enableWorkload)
+}
+
+func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName, secretName, nameHash string) error {
+	logger := log.FromContext(ctx)
+
+	image := "quay.io/containerdisks/fedora:latest"
+	if len(sandbox.Spec.PodTemplate.Spec.Containers) > 0 {
+		image = sandbox.Spec.PodTemplate.Spec.Containers[0].Image
+	}
+
+	labels := map[string]interface{}{sandboxLabel: nameHash}
+	for k, v := range sandbox.Spec.PodTemplate.ObjectMeta.Labels {
+		if !isSystemLabel(k) {
+			labels[k] = v
+		}
+	}
+
+	vm := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "kubevirt.io/v1",
+			"kind":       "VirtualMachine",
+			"metadata": map[string]interface{}{
+				"name":      vmName,
+				"namespace": sandbox.Namespace,
+				"labels":    labels,
+			},
+			"spec": map[string]interface{}{
+				"running": true,
+				"template": map[string]interface{}{
+					"metadata": map[string]interface{}{"labels": labels},
+					"spec": map[string]interface{}{
+						"domain": map[string]interface{}{
+							"cpu": map[string]interface{}{"cores": int64(2)},
+							"devices": map[string]interface{}{
+								"disks": []interface{}{
+									map[string]interface{}{
+										"name": "containerdisk",
+										"disk": map[string]interface{}{"bus": "virtio"},
+									},
+									map[string]interface{}{
+										"name": "cloudinitdisk",
+										"disk": map[string]interface{}{"bus": "virtio"},
+									},
+								},
+								"interfaces": []interface{}{
+									map[string]interface{}{
+										"name":       "default",
+										"masquerade": map[string]interface{}{},
+									},
+								},
+							},
+							"resources": map[string]interface{}{
+								"requests": map[string]interface{}{"memory": "2048Mi"},
+							},
+						},
+						"networks": []interface{}{
+							map[string]interface{}{
+								"name": "default",
+								"pod":  map[string]interface{}{},
+							},
+						},
+						"volumes": []interface{}{
+							map[string]interface{}{
+								"name":          "containerdisk",
+								"containerDisk": map[string]interface{}{"image": image},
+							},
+							map[string]interface{}{
+								"name": "cloudinitdisk",
+								"cloudInitNoCloud": map[string]interface{}{
+									"secretRef": map[string]interface{}{"name": secretName},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := ctrl.SetControllerReference(sandbox, vm, r.Scheme); err != nil {
+		return fmt.Errorf("SetControllerReference for VirtualMachine: %w", err)
+	}
+	if err := r.Create(ctx, vm, client.FieldOwner(sandboxControllerFieldOwner)); err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to create VirtualMachine: %w", err)
+	}
+	logger.Info("Created VirtualMachine", "VM.Name", vmName, "Image", image)
+	return nil
+}
+
+func (r *SandboxReconciler) updateStatusFromVMI(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName string) error {
+	vmi := &unstructured.Unstructured{}
+	vmi.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "kubevirt.io", Version: "v1", Kind: "VirtualMachineInstance",
+	})
+
+	err := r.Get(ctx, types.NamespacedName{Name: vmName, Namespace: sandbox.Namespace}, vmi)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			sandbox.Status.PodIPs = nil
+			sandbox.Status.NodeName = ""
+			meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+				Type:               string(sandboxv1beta1.SandboxConditionReady),
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: sandbox.Generation,
+				Reason:             sandboxv1beta1.SandboxReasonDependenciesNotReady,
+				Message:            "VirtualMachineInstance does not exist yet",
+			})
+			return nil
+		}
+		return fmt.Errorf("failed to get VMI: %w", err)
+	}
+
+	phase, _, _ := unstructured.NestedString(vmi.Object, "status", "phase")
+	nodeName, _, _ := unstructured.NestedString(vmi.Object, "status", "nodeName")
+
+	var podIP string
+	if interfaces, found, _ := unstructured.NestedSlice(vmi.Object, "status", "interfaces"); found && len(interfaces) > 0 {
+		if iface, ok := interfaces[0].(map[string]interface{}); ok {
+			if ip, ok := iface["ipAddress"].(string); ok {
+				podIP = ip
+			}
+		}
+	}
+
+	if podIP != "" {
+		sandbox.Status.PodIPs = []string{podIP}
+	} else {
+		sandbox.Status.PodIPs = nil
+	}
+	sandbox.Status.NodeName = nodeName
+	sandbox.Status.LabelSelector = fmt.Sprintf("%s=%s", sandboxLabel, NameHash(sandbox.Name))
+
+	switch phase {
+	case "Running":
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1beta1.SandboxConditionReady),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             sandboxv1beta1.SandboxReasonDependenciesReady,
+			Message:            "VirtualMachineInstance is Running",
+		})
+	case "Succeeded", "Failed":
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1beta1.SandboxConditionReady),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             "VMI" + phase,
+			Message:            "VirtualMachineInstance " + strings.ToLower(phase),
+		})
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1beta1.SandboxConditionFinished),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             "VMI" + phase,
+			Message:            "VirtualMachineInstance " + strings.ToLower(phase),
+		})
+	default:
+		meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+			Type:               string(sandboxv1beta1.SandboxConditionReady),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: sandbox.Generation,
+			Reason:             sandboxv1beta1.SandboxReasonDependenciesNotReady,
+			Message:            fmt.Sprintf("VMI phase: %s", phase),
+		})
+	}
+
+	return nil
+}
+
+func (r *SandboxReconciler) suspendVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName string) error {
+	logger := log.FromContext(ctx)
+
+	vm := &unstructured.Unstructured{}
+	vm.SetGroupVersionKind(kubevirtVMGVK)
+	err := r.Get(ctx, types.NamespacedName{Name: vmName, Namespace: sandbox.Namespace}, vm)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			sandbox.Status.PodIPs = nil
+			sandbox.Status.NodeName = ""
+			meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+				Type: string(sandboxv1beta1.SandboxConditionSuspended), Status: metav1.ConditionTrue,
+				ObservedGeneration: sandbox.Generation, Reason: "VMStopped", Message: "VirtualMachine stopped",
+			})
+			meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+				Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionFalse,
+				ObservedGeneration: sandbox.Generation, Reason: sandboxv1beta1.SandboxReasonSuspended, Message: "Sandbox is suspended",
+			})
+			return nil
+		}
+		return fmt.Errorf("failed to get VM for suspend: %w", err)
+	}
+
+	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
+	if running {
+		logger.Info("Suspending VirtualMachine", "VM.Name", vmName)
+		patch := client.MergeFrom(vm.DeepCopy())
+		unstructured.SetNestedField(vm.Object, false, "spec", "running")
+		if err := r.Patch(ctx, vm, patch); err != nil {
+			return fmt.Errorf("failed to patch VM running=false: %w", err)
+		}
+	}
+
+	sandbox.Status.PodIPs = nil
+	sandbox.Status.NodeName = ""
+	meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+		Type: string(sandboxv1beta1.SandboxConditionSuspended), Status: metav1.ConditionTrue,
+		ObservedGeneration: sandbox.Generation, Reason: "VMStopped", Message: "VirtualMachine stopped",
+	})
+	meta.SetStatusCondition(&sandbox.Status.Conditions, metav1.Condition{
+		Type: string(sandboxv1beta1.SandboxConditionReady), Status: metav1.ConditionFalse,
+		ObservedGeneration: sandbox.Generation, Reason: sandboxv1beta1.SandboxReasonSuspended, Message: "Sandbox is suspended",
+	})
+	return nil
+}
+
 func (r *SandboxReconciler) updatePodMetadata(ctx context.Context, pod *corev1.Pod, sandbox *sandboxv1beta1.Sandbox, nameHash string) bool {
 	logger := log.FromContext(ctx)
 	updated := false
@@ -1611,10 +2151,16 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 		return err
 	}
 
+	// Unstructured prototype for VirtualMachine watches
+	vmProto := &unstructured.Unstructured{}
+	vmProto.SetGroupVersionKind(kubevirtVMGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1beta1.Sandbox{}).
 		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
+		Owns(&corev1.Secret{}, builder.WithPredicates(labelSelectorPredicate)).
+		Owns(vmProto, builder.WithPredicates(labelSelectorPredicate)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
 		Complete(r)
 }
