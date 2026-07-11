@@ -20,12 +20,14 @@ The introduction of **`volumeClaimTemplates`** into the `SandboxTemplate` API so
 ## How It Works Under the Hood
 1. You define a `volumeClaimTemplates` list inside your `SandboxTemplate`.
 2. When a `SandboxClaim` requests a sandbox from this template (or a `SandboxWarmPool` provisions a new one), the volume claim templates are seamlessly propagated to the individual `Sandbox` Custom Resources.
-3. The Sandbox controller then provisions the associated PVCs and merges these PVCs into the underlying Pod specifications, mounting them securely inside the container. 
+3. The Sandbox controller then provisions the associated PVCs and attaches them to the workload:
+   - **Pod backend (default):** merges the PVCs into the Pod spec and mounts them via container `volumeMounts`.
+   - **VirtualMachine backend:** attaches each claim referenced by a `volumeMount` on the first container as a virtio disk (serial = sanitized volume name) and mounts it in the guest at the declared `mountPath` on every boot. Paths that are PVC-backed skip the default tmpfs overlay used for writable roots.
 
 ---
 
 ### Create a SandboxTemplate with Volume Claims
-To use a volume, you need to add the `volumeClaimTemplates` array to your `SandboxTemplate` specification and reference it in the `volumeMounts` of your container.
+To use a volume, you need to add the `volumeClaimTemplates` array to your `SandboxTemplate` specification and reference it in the `volumeMounts` of your container. The same `volumeClaimTemplates` + `volumeMounts` shape works for both `runtimeBackend: Pod` and `runtimeBackend: VirtualMachine`.
 
 Create a file named `sandbox-template-with-volume.yaml`:
 

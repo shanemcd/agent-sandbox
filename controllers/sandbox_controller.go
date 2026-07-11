@@ -168,6 +168,91 @@ func MergeVolumeClaimVolumes(existing []corev1.Volume, pvcVolumes []corev1.Volum
 	return append(filtered, pvcVolumes...)
 }
 
+// vmVolumeMount describes a volumeClaimTemplate referenced by a volumeMount on
+// the first container, for attachment as a KubeVirt virtio disk.
+type vmVolumeMount struct {
+	Name      string // volumeClaimTemplate / volumeMount name
+	MountPath string
+	ClaimName string // PVC name: <templateName>-<sandboxName>
+	Serial    string // virtio disk serial (alphanumeric, <= 20)
+}
+
+// virtioDiskSerial returns a KubeVirt-compatible disk serial for name.
+// Virtio serials must be alphanumeric and at most 20 characters.
+func virtioDiskSerial(name string) string {
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	s := b.String()
+	if s == "" {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(name))
+		s = fmt.Sprintf("%x", h.Sum32())
+	}
+	if len(s) > 20 {
+		s = s[:20]
+	}
+	return s
+}
+
+// collectVMVolumeMounts returns mounts from the first container that reference
+// a volumeClaimTemplate. Unreferenced claim templates are omitted (PVC is still
+// created by reconcilePVCs, but not attached to the VM).
+func collectVMVolumeMounts(sandbox *sandboxv1beta1.Sandbox) []vmVolumeMount {
+	claimNames := make(map[string]struct{}, len(sandbox.Spec.VolumeClaimTemplates))
+	for _, t := range sandbox.Spec.VolumeClaimTemplates {
+		claimNames[t.Name] = struct{}{}
+	}
+	if len(claimNames) == 0 {
+		return nil
+	}
+	if len(sandbox.Spec.PodTemplate.Spec.Containers) == 0 {
+		return nil
+	}
+	var out []vmVolumeMount
+	seen := make(map[string]struct{})
+	for _, m := range sandbox.Spec.PodTemplate.Spec.Containers[0].VolumeMounts {
+		if _, ok := claimNames[m.Name]; !ok {
+			continue
+		}
+		if _, dup := seen[m.Name]; dup {
+			continue
+		}
+		seen[m.Name] = struct{}{}
+		out = append(out, vmVolumeMount{
+			Name:      m.Name,
+			MountPath: m.MountPath,
+			ClaimName: m.Name + "-" + sandbox.Name,
+			Serial:    virtioDiskSerial(m.Name),
+		})
+	}
+	return out
+}
+
+// appendVMClaimDisks appends virtio disks and persistentVolumeClaim volumes for
+// the given mounts onto the KubeVirt unstructured disk/volume slices.
+func appendVMClaimDisks(disks, volumes []interface{}, mounts []vmVolumeMount) (diskOut, volumeOut []interface{}) {
+	diskOut = disks
+	volumeOut = volumes
+	for _, m := range mounts {
+		diskOut = append(diskOut, map[string]interface{}{
+			"name":   m.Name,
+			"serial": m.Serial,
+			"disk":   map[string]interface{}{"bus": "virtio"},
+		})
+		volumeOut = append(volumeOut, map[string]interface{}{
+			"name": m.Name,
+			"persistentVolumeClaim": map[string]interface{}{
+				"claimName": m.ClaimName,
+			},
+		})
+	}
+	return diskOut, volumeOut
+}
+
 var (
 	// Scheme for use by sandbox controllers. Registers required types for client.
 	Scheme = runtime.NewScheme()
@@ -1313,6 +1398,33 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 func (r *SandboxReconciler) createCloudInitSecret(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, secretName, nameHash string) error {
 	logger := log.FromContext(ctx)
 
+	// When the gateway endpoint uses TLS (https://), the supervisor needs
+	// client certs to connect back. Fetch them from the well-known
+	// openshell-client-tls secret in the gateway namespace.
+	var clientTLS *cloudInitTLSData
+	var gatewayEndpoint string
+	for _, c := range sandbox.Spec.PodTemplate.Spec.Containers {
+		for _, e := range c.Env {
+			if e.Name == "OPENSHELL_ENDPOINT" {
+				gatewayEndpoint = e.Value
+			}
+		}
+	}
+	if strings.HasPrefix(gatewayEndpoint, "https://") {
+		gwNamespace := gatewayNamespaceFromEndpoint(gatewayEndpoint)
+		tlsSecret := &corev1.Secret{}
+		if err := r.Get(ctx, types.NamespacedName{Name: "openshell-client-tls", Namespace: gwNamespace}, tlsSecret); err != nil {
+			logger.Info("Could not fetch client TLS secret for VM; sandbox-to-gateway TLS will not work",
+				"namespace", gwNamespace, "error", err)
+		} else {
+			clientTLS = &cloudInitTLSData{
+				CA:   string(tlsSecret.Data["ca.crt"]),
+				Cert: string(tlsSecret.Data["tls.crt"]),
+				Key:  string(tlsSecret.Data["tls.key"]),
+			}
+		}
+	}
+
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName,
@@ -1320,7 +1432,7 @@ func (r *SandboxReconciler) createCloudInitSecret(ctx context.Context, sandbox *
 			Labels:    map[string]string{sandboxLabel: nameHash},
 		},
 		StringData: map[string]string{
-			"userdata": buildCloudInitUserdata(sandbox),
+			"userdata": buildCloudInitUserdata(sandbox, clientTLS),
 		},
 	}
 
@@ -1337,11 +1449,40 @@ func (r *SandboxReconciler) createCloudInitSecret(ctx context.Context, sandbox *
 	return nil
 }
 
-func buildCloudInitUserdata(sandbox *sandboxv1beta1.Sandbox) string {
+type cloudInitTLSData struct {
+	CA   string
+	Cert string
+	Key  string
+}
+
+func gatewayNamespaceFromEndpoint(endpoint string) string {
+	// https://openshell.openshell.svc.cluster.local:8080 → "openshell"
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	host := strings.Split(endpoint, ":")[0]
+	parts := strings.Split(host, ".")
+	if len(parts) >= 2 {
+		return parts[1]
+	}
+	return "openshell"
+}
+
+func indentPEM(pem string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(pem, "\n"), "\n") {
+		sb.WriteString("      ")
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func buildCloudInitUserdata(sandbox *sandboxv1beta1.Sandbox, clientTLS *cloudInitTLSData) string {
 	const (
-		supervisorBinary = "/opt/openshell/bin/openshell-sandbox"
-		sandboxTokenPath = "/etc/openshell/auth/sandbox.jwt"
-		sshPort          = 22
+		supervisorBinary   = "/opt/openshell/bin/openshell-sandbox"
+		sandboxTokenPath   = "/etc/openshell/auth/sandbox.jwt"
+		clientTLSDir       = "/etc/openshell-tls/client"
+		sshPort            = 22
 	)
 
 	// Build systemd Environment= lines from the sandbox spec environment
@@ -1353,12 +1494,11 @@ func buildCloudInitUserdata(sandbox *sandboxv1beta1.Sandbox) string {
 	envLines = append(envLines, "Environment=OPENSHELL_SANDBOX_UID=10001")
 	envLines = append(envLines, "Environment=OPENSHELL_SANDBOX_GID=10001")
 
-	// Extract OPENSHELL_ENDPOINT, token, and optional sibling workload command.
-	// When OPENSHELL_SANDBOX_COMMAND is set, the supervisor runs network-only
-	// and a separate systemd unit enters the netns to run the command (VM
-	// sidecar topology used by NemoClaw/Hermes).
+	// When OPENSHELL_SANDBOX_COMMAND is set (NemoClaw/Hermes VM), the supervisor
+	// runs default --mode=network,process and execs the command as the Landlock'd
+	// child. Preserve mixed-ownership seals under /sandbox (root trust anchors).
 	var sandboxToken string
-	var sandboxCommand string
+	var hasSandboxCommand bool
 	for _, c := range sandbox.Spec.PodTemplate.Spec.Containers {
 		for _, e := range c.Env {
 			switch e.Name {
@@ -1367,20 +1507,25 @@ func buildCloudInitUserdata(sandbox *sandboxv1beta1.Sandbox) string {
 			case "OPENSHELL_SANDBOX_TOKEN":
 				sandboxToken = e.Value
 			case "OPENSHELL_SANDBOX_COMMAND":
-				sandboxCommand = e.Value
+				hasSandboxCommand = true
+				envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_SANDBOX_COMMAND=%s", e.Value))
 			default:
 				envLines = append(envLines, fmt.Sprintf("Environment=%s=%s", e.Name, e.Value))
 			}
 		}
 	}
 
+	if clientTLS != nil {
+		envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_TLS_CA=%s/ca.crt", clientTLSDir))
+		envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_TLS_CERT=%s/tls.crt", clientTLSDir))
+		envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_TLS_KEY=%s/tls.key", clientTLSDir))
+	}
+
 	if sandboxToken != "" {
 		envLines = append(envLines, fmt.Sprintf("Environment=OPENSHELL_SANDBOX_TOKEN_FILE=%s", sandboxTokenPath))
 	}
-
-	supervisorExec := supervisorBinary
-	if sandboxCommand != "" {
-		supervisorExec = supervisorBinary + " --mode=network"
+	if hasSandboxCommand {
+		envLines = append(envLines, "Environment=OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1")
 	}
 
 	envBlock := strings.Join(envLines, "\n      ")
@@ -1399,66 +1544,20 @@ func buildCloudInitUserdata(sandbox *sandboxv1beta1.Sandbox) string {
 `, sandboxTokenPath, sandboxToken)
 	}
 
-	// Sibling workload unit: enter supervisor netns, load provider placeholders,
-	// publish entrypoint PID for proxy identity binding, then run the command.
-	// A wrapper script avoids systemd's $$ escaping and runs as root so
-	// NemoClaw can recover seals / apply root:sandbox 1775 posture before
-	// dropping privileges itself (same as the container entrypoint).
-	var enableWorkload string
-	if sandboxCommand != "" {
-		fmt.Fprintf(&writeFiles, `  - path: /etc/openshell/sandbox-workload-start
-    permissions: "0755"
+	if clientTLS != nil {
+		fmt.Fprintf(&writeFiles, `  - path: %s/ca.crt
     content: |
-      #!/bin/bash
-      set -euo pipefail
-      # Wait for sidecar coordination files. Source provider.env here (not only
-      # via systemd EnvironmentFile) so credential placeholders are present even
-      # if the unit started before the supervisor finished publishing them.
-      until [ -s /run/openshell/netns ] && [ -s /run/openshell/provider.env ]; do sleep 1; done
-      set -a
-      # shellcheck disable=SC1091
-      . /run/openshell/provider.env
-      set +a
-      # Locked NemoClaw posture: root:sandbox sticky. tmpfs overlays reset this.
-      chown root:sandbox /sandbox 2>/dev/null || true
-      chmod 1775 /sandbox 2>/dev/null || true
-      NS=$(cat /run/openshell/netns)
-      exec nsenter --net="$NS" /bin/bash -c 'echo $$ > /run/openshell/entrypoint.pid; exec %s'
-  - path: /etc/systemd/system/sandbox-workload.service
-    permissions: "0644"
+%s
+    permissions: "0444"
+  - path: %s/tls.crt
     content: |
-      [Unit]
-      Description=Sandbox Workload (netns sibling)
-      After=openshell-sandbox.service
-      Requires=openshell-sandbox.service
-
-      [Service]
-      Type=simple
-      EnvironmentFile=-/run/openshell/provider.env
-      Environment=HOME=/sandbox
-      Environment=PATH=/opt/hermes/.venv/bin:/opt/rust/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      Environment=CARGO_HOME=/opt/rust/cargo
-      Environment=RUSTUP_HOME=/opt/rust/rustup
-      Environment=NEMOCLAW_CAPS_DROPPED=1
-      Environment=http_proxy=http://10.200.0.1:3128
-      Environment=https_proxy=http://10.200.0.1:3128
-      Environment=HTTP_PROXY=http://10.200.0.1:3128
-      Environment=HTTPS_PROXY=http://10.200.0.1:3128
-      Environment=no_proxy=localhost,127.0.0.1,::1
-      Environment=NO_PROXY=localhost,127.0.0.1,::1
-      Environment=SSL_CERT_FILE=/etc/openshell-tls/ca-bundle.pem
-      Environment=REQUESTS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem
-      Environment=CURL_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem
-      Environment=NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem
-      Environment=GIT_SSL_CAINFO=/etc/openshell-tls/ca-bundle.pem
-      ExecStart=/etc/openshell/sandbox-workload-start
-      Restart=on-failure
-      RestartSec=5
-
-      [Install]
-      WantedBy=multi-user.target
-`, sandboxCommand)
-		enableWorkload = "\n  - systemctl enable --now sandbox-workload.service"
+%s
+    permissions: "0444"
+  - path: %s/tls.key
+    content: |
+%s
+    permissions: "0400"
+`, clientTLSDir, indentPEM(clientTLS.CA), clientTLSDir, indentPEM(clientTLS.Cert), clientTLSDir, indentPEM(clientTLS.Key))
 	}
 
 	// Collect SSH authorized keys from container env vars
@@ -1482,6 +1581,8 @@ func buildCloudInitUserdata(sandbox *sandboxv1beta1.Sandbox) string {
 		sshKeysYAML = sb.String()
 	}
 
+	prepareScript := buildPrepareWritableRootsScript(collectVMVolumeMounts(sandbox))
+
 	return fmt.Sprintf(`#cloud-config
 ssh_pwauth: true
 chpasswd:
@@ -1499,18 +1600,49 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     lock_passwd: false%s
 
+# Drop console loglevel early so audit/info printk does not flood VNC/serial.
+bootcmd:
+  - [ sysctl, -w, kernel.printk=3 4 1 7 ]
+
 write_files:
 %s
+  - path: /etc/sysctl.d/99-openshell-quiet-console.conf
+    permissions: "0644"
+    content: |
+      # Keep audit and other info-level printk off the interactive console.
+      kernel.printk = 3 4 1 7
+  - path: /etc/openshell/prepare-writable-roots.sh
+    permissions: "0755"
+    content: |
+%s
+  - path: /etc/systemd/system/openshell-sandbox-prepare.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Prepare writable roots for OpenShell sandbox
+      DefaultDependencies=no
+      After=local-fs.target
+      Before=openshell-sandbox.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/etc/openshell/prepare-writable-roots.sh
+
+      [Install]
+      WantedBy=openshell-sandbox.service
   - path: /etc/systemd/system/openshell-sandbox.service
     permissions: "0644"
     content: |
       [Unit]
       Description=OpenShell Sandbox Supervisor
-      After=network-online.target sshd.service
+      After=network-online.target sshd.service openshell-sandbox-prepare.service
       Wants=network-online.target
+      Requires=openshell-sandbox-prepare.service
 
       [Service]
       Type=simple
+      ExecStartPre=-/bin/bash -c 'for ns in $(ip netns list 2>/dev/null | grep "^sandbox-" | cut -d" " -f1); do ip netns delete "$ns" 2>/dev/null || true; done'
       ExecStart=%s
       Restart=on-failure
       RestartSec=5
@@ -1520,48 +1652,137 @@ write_files:
       WantedBy=multi-user.target
 
 runcmd:
+  - sysctl -p /etc/sysctl.d/99-openshell-quiet-console.conf || true
   - sed -i 's/^#\?Port .*/Port %d/' /etc/ssh/sshd_config
   - systemctl restart sshd || true
   - mkdir -p /run/openshell
-  - |
-    # Make writable paths for bootc/ostree images where / is read-only.
-    # Copy image content into tmpfs overlays, preserving ownership.
-    for dir in /sandbox /opt/data; do
-      mkdir -p "$dir" 2>/dev/null || true
-      if ! touch "$dir/.write-test" 2>/dev/null; then
-        tmp=$(mktemp -d)
-        cp -a "$dir/." "$tmp/" 2>/dev/null || true
-        mount -t tmpfs tmpfs "$dir"
-        cp -a "$tmp/." "$dir/" 2>/dev/null || true
-        rm -rf "$tmp"
-      else
-        rm -f "$dir/.write-test"
-      fi
-    done
-    # NemoClaw locked posture after tmpfs remount (root:root looks like an orphaned seal).
-    chown root:sandbox /sandbox 2>/dev/null || true
-    chmod 1775 /sandbox 2>/dev/null || true
-    if [ -d /sandbox/.hermes ]; then
-      # bootc numeric UIDs from the Debian stage can remap to wrong Fedora names;
-      # normalize mutable trees to sandbox, then re-lock trust anchors.
-      chown -R sandbox:sandbox /sandbox/.hermes 2>/dev/null || true
-      chown root:root /sandbox/.hermes 2>/dev/null || true
-      chmod 755 /sandbox/.hermes 2>/dev/null || true
-      for f in config.yaml .config-hash SOUL.md; do
-        if [ -e "/sandbox/.hermes/$f" ]; then
-          chown root:root "/sandbox/.hermes/$f" 2>/dev/null || true
-          chmod 444 "/sandbox/.hermes/$f" 2>/dev/null || true
-        fi
-      done
-      if [ -e /sandbox/.hermes/.env ]; then
-        chown sandbox:sandbox /sandbox/.hermes/.env 2>/dev/null || true
-        chmod 640 /sandbox/.hermes/.env 2>/dev/null || true
-      fi
-    fi
-    mkdir -p /run/nemoclaw
   - systemctl daemon-reload
-  - systemctl enable --now openshell-sandbox.service%s
-`, sshKeysYAML, writeFiles.String(), supervisorExec, envBlock, sshPort, enableWorkload)
+  - systemctl enable --now openshell-sandbox.service
+`, sshKeysYAML, writeFiles.String(), prepareScript, supervisorBinary, envBlock, sshPort)
+}
+
+// buildPrepareWritableRootsScript returns the body of prepare-writable-roots.sh
+// indented for embedding under a cloud-init write_files content: | block.
+// mounts are PVC-backed disks attached to the VM; those paths skip the tmpfs overlay.
+func buildPrepareWritableRootsScript(mounts []vmVolumeMount) string {
+	var sb strings.Builder
+	// 6-space indent matches other write_files content blocks in cloud-init userdata.
+	const ind = "      "
+	w := func(format string, args ...interface{}) {
+		sb.WriteString(ind)
+		fmt.Fprintf(&sb, format, args...)
+		sb.WriteByte('\n')
+	}
+	w("#!/bin/bash")
+	w("# Runs every boot (via openshell-sandbox-prepare.service). cloud-init")
+	w("# runcmd only runs on first boot, so bootc/ostree read-only roots must")
+	w("# be re-overlaid after every reboot before openshell-sandbox starts.")
+	w("set -euo pipefail")
+	w("# Keep audit/info printk off VNC/serial; journal still retains them.")
+	w("sysctl -q -w kernel.printk=\"3 4 1 7\" 2>/dev/null || true")
+	w("")
+	if len(mounts) > 0 {
+		w("# Mount volumeClaimTemplate disks (virtio serial -> mountPath).")
+		w("# First boot seeds from the image tree (same idea as OpenShell's")
+		w("# workspace-init), using .workspace-initialized as the sentinel.")
+		w("mount_pvc_disk() {")
+		w("  local serial=\"$1\" mount_path=\"$2\" device seed")
+		w("  device=\"/dev/disk/by-id/virtio-${serial}\"")
+		w("  for _ in $(seq 1 60); do")
+		w("    [ -e \"$device\" ] && break")
+		w("    sleep 1")
+		w("  done")
+		w("  if [ ! -e \"$device\" ]; then")
+		w("    echo \"PVC disk serial=${serial} not found at $device\" >&2")
+		w("    return 1")
+		w("  fi")
+		w("  if ! blkid \"$device\" >/dev/null 2>&1; then")
+		w("    mkfs.ext4 -F \"$device\"")
+		w("  fi")
+		w("  # Snapshot image contents before the PVC covers mount_path.")
+		w("  seed=$(mktemp -d)")
+		w("  if [ -d \"$mount_path\" ] && ! mountpoint -q \"$mount_path\" 2>/dev/null; then")
+		w("    tar -C \"$mount_path\" -cf - . 2>/dev/null | tar -C \"$seed\" -xpf - 2>/dev/null || true")
+		w("  fi")
+		w("  mkdir -p \"$mount_path\"")
+		w("  if ! mountpoint -q \"$mount_path\" 2>/dev/null; then")
+		w("    mount \"$device\" \"$mount_path\"")
+		w("  fi")
+		w("  if [ ! -f \"$mount_path/.workspace-initialized\" ]; then")
+		w("    if [ -n \"$(ls -A \"$seed\" 2>/dev/null)\" ]; then")
+		w("      tar -C \"$seed\" -cf - . | tar -C \"$mount_path\" -xpf -")
+		w("    fi")
+		w("    touch \"$mount_path/.workspace-initialized\"")
+		w("  fi")
+		w("  rm -rf \"$seed\"")
+		w("}")
+		for _, m := range mounts {
+			w("mount_pvc_disk %q %q", m.Serial, m.MountPath)
+		}
+		w("")
+	}
+
+	pvcPaths := make(map[string]struct{}, len(mounts))
+	for _, m := range mounts {
+		pvcPaths[m.MountPath] = struct{}{}
+	}
+	tmpfsDirs := make([]string, 0, 2)
+	for _, dir := range []string{"/sandbox", "/opt/data"} {
+		if _, skip := pvcPaths[dir]; skip {
+			continue
+		}
+		tmpfsDirs = append(tmpfsDirs, dir)
+	}
+	if len(tmpfsDirs) > 0 {
+		w("# tmpfs overlay for image paths that are not PVC-backed.")
+		fmt.Fprintf(&sb, "%sfor dir in", ind)
+		for _, dir := range tmpfsDirs {
+			fmt.Fprintf(&sb, " %s", dir)
+		}
+		sb.WriteString("; do\n")
+		w("  mkdir -p \"$dir\" 2>/dev/null || true")
+		w("  if ! touch \"$dir/.write-test\" 2>/dev/null; then")
+		w("    tmp=$(mktemp -d)")
+		w("    cp -a \"$dir/.\" \"$tmp/\" 2>/dev/null || true")
+		w("    mount -t tmpfs tmpfs \"$dir\"")
+		w("    cp -a \"$tmp/.\" \"$dir/\" 2>/dev/null || true")
+		w("    rm -rf \"$tmp\"")
+		w("  else")
+		w("    rm -f \"$dir/.write-test\"")
+		w("  fi")
+		w("done")
+	} else {
+		w("# All default writable roots are PVC-backed; skipping tmpfs overlays.")
+	}
+	w("# NemoClaw locked posture after remount (root:root looks like an orphaned seal).")
+	w("chown root:sandbox /sandbox 2>/dev/null || true")
+	w("chmod 1775 /sandbox 2>/dev/null || true")
+	w("if [ -d /sandbox/.hermes ]; then")
+	w("  # bootc numeric UIDs from the Debian stage can remap to wrong Fedora names;")
+	w("  # normalize mutable trees to sandbox, then re-lock trust anchors.")
+	w("  # Directory is root:sandbox sticky so the Landlock'd sandbox child can")
+	w("  # atomic-replace .env / .config-hash without being able to unlink root seals.")
+	w("  chown -R sandbox:sandbox /sandbox/.hermes 2>/dev/null || true")
+	w("  chown root:sandbox /sandbox/.hermes 2>/dev/null || true")
+	w("  chmod 1775 /sandbox/.hermes 2>/dev/null || true")
+	w("  for f in config.yaml SOUL.md; do")
+	w("    if [ -e \"/sandbox/.hermes/$f\" ]; then")
+	w("      chown root:root \"/sandbox/.hermes/$f\" 2>/dev/null || true")
+	w("      chmod 444 \"/sandbox/.hermes/$f\" 2>/dev/null || true")
+	w("    fi")
+	w("  done")
+	w("  if [ -e /sandbox/.hermes/.config-hash ]; then")
+	w("    chown sandbox:sandbox /sandbox/.hermes/.config-hash 2>/dev/null || true")
+	w("    chmod 640 /sandbox/.hermes/.config-hash 2>/dev/null || true")
+	w("  fi")
+	w("  if [ -e /sandbox/.hermes/.env ]; then")
+	w("    chown sandbox:sandbox /sandbox/.hermes/.env 2>/dev/null || true")
+	w("    chmod 640 /sandbox/.hermes/.env 2>/dev/null || true")
+	w("  fi")
+	w("fi")
+	w("mkdir -p /run/nemoclaw /run/openshell")
+	// Trim trailing newline from last w(); cloud-init embedding expects no extra blank.
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName, secretName, nameHash string) error {
@@ -1578,6 +1799,30 @@ func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *s
 			labels[k] = v
 		}
 	}
+
+	disks := []interface{}{
+		map[string]interface{}{
+			"name": "containerdisk",
+			"disk": map[string]interface{}{"bus": "virtio"},
+		},
+		map[string]interface{}{
+			"name": "cloudinitdisk",
+			"disk": map[string]interface{}{"bus": "virtio"},
+		},
+	}
+	volumes := []interface{}{
+		map[string]interface{}{
+			"name":          "containerdisk",
+			"containerDisk": map[string]interface{}{"image": image},
+		},
+		map[string]interface{}{
+			"name": "cloudinitdisk",
+			"cloudInitNoCloud": map[string]interface{}{
+				"secretRef": map[string]interface{}{"name": secretName},
+			},
+		},
+	}
+	disks, volumes = appendVMClaimDisks(disks, volumes, collectVMVolumeMounts(sandbox))
 
 	vm := &unstructured.Unstructured{
 		Object: map[string]interface{}{
@@ -1596,16 +1841,7 @@ func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *s
 						"domain": map[string]interface{}{
 							"cpu": map[string]interface{}{"cores": int64(2)},
 							"devices": map[string]interface{}{
-								"disks": []interface{}{
-									map[string]interface{}{
-										"name": "containerdisk",
-										"disk": map[string]interface{}{"bus": "virtio"},
-									},
-									map[string]interface{}{
-										"name": "cloudinitdisk",
-										"disk": map[string]interface{}{"bus": "virtio"},
-									},
-								},
+								"disks": disks,
 								"interfaces": []interface{}{
 									map[string]interface{}{
 										"name":       "default",
@@ -1623,18 +1859,7 @@ func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *s
 								"pod":  map[string]interface{}{},
 							},
 						},
-						"volumes": []interface{}{
-							map[string]interface{}{
-								"name":          "containerdisk",
-								"containerDisk": map[string]interface{}{"image": image},
-							},
-							map[string]interface{}{
-								"name": "cloudinitdisk",
-								"cloudInitNoCloud": map[string]interface{}{
-									"secretRef": map[string]interface{}{"name": secretName},
-								},
-							},
-						},
+						"volumes": volumes,
 					},
 				},
 			},

@@ -4426,6 +4426,100 @@ func TestMergeVolumeClaimVolumes(t *testing.T) {
 	})
 }
 
+func TestVirtioDiskSerial(t *testing.T) {
+	assert.Equal(t, "agentdata", virtioDiskSerial("agent-data"))
+	assert.Equal(t, "sandbox", virtioDiskSerial("sandbox"))
+	long := strings.Repeat("a", 25)
+	assert.Equal(t, strings.Repeat("a", 20), virtioDiskSerial(long))
+}
+
+func TestCollectVMVolumeMounts(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:  "sandbox",
+							Image: "img:latest",
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "sandbox-data", MountPath: "/sandbox"},
+								{Name: "scratch", MountPath: "/tmp/scratch"}, // not a claim template
+								{Name: "sandbox-data", MountPath: "/also"},   // duplicate name ignored
+							},
+						}},
+					},
+				},
+				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{
+					{EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "sandbox-data"}},
+					{EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "unused-claim"}},
+				},
+			},
+		},
+	}
+
+	mounts := collectVMVolumeMounts(sandbox)
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "sandbox-data", mounts[0].Name)
+	assert.Equal(t, "/sandbox", mounts[0].MountPath)
+	assert.Equal(t, "sandbox-data-hermes", mounts[0].ClaimName)
+	assert.Equal(t, "sandboxdata", mounts[0].Serial)
+}
+
+func TestAppendVMClaimDisks(t *testing.T) {
+	disks := []interface{}{
+		map[string]interface{}{"name": "containerdisk"},
+	}
+	volumes := []interface{}{
+		map[string]interface{}{"name": "containerdisk"},
+	}
+	mounts := []vmVolumeMount{{
+		Name: "agent-data", MountPath: "/data", ClaimName: "agent-data-sb", Serial: "agentdata",
+	}}
+
+	disks, volumes = appendVMClaimDisks(disks, volumes, mounts)
+	require.Len(t, disks, 2)
+	require.Len(t, volumes, 2)
+
+	disk := disks[1].(map[string]interface{})
+	assert.Equal(t, "agent-data", disk["name"])
+	assert.Equal(t, "agentdata", disk["serial"])
+	assert.Equal(t, map[string]interface{}{"bus": "virtio"}, disk["disk"])
+
+	vol := volumes[1].(map[string]interface{})
+	assert.Equal(t, "agent-data", vol["name"])
+	pvc := vol["persistentVolumeClaim"].(map[string]interface{})
+	assert.Equal(t, "agent-data-sb", pvc["claimName"])
+
+	// Unreferenced / empty mounts leave base disks alone.
+	d2, v2 := appendVMClaimDisks(disks[:1], volumes[:1], nil)
+	require.Len(t, d2, 1)
+	require.Len(t, v2, 1)
+}
+
+func TestBuildPrepareWritableRootsScript_PVCMounts(t *testing.T) {
+	script := buildPrepareWritableRootsScript([]vmVolumeMount{{
+		Name: "sandbox-data", MountPath: "/sandbox", ClaimName: "sandbox-data-hermes", Serial: "sandboxdata",
+	}})
+
+	assert.Contains(t, script, "mount_pvc_disk")
+	assert.Contains(t, script, `mount_pvc_disk "sandboxdata" "/sandbox"`)
+	assert.Contains(t, script, "mkfs.ext4")
+	assert.Contains(t, script, `/dev/disk/by-id/virtio-${serial}`)
+	assert.Contains(t, script, ".workspace-initialized")
+	// /sandbox is PVC-backed; tmpfs loop should only cover /opt/data.
+	assert.Contains(t, script, "for dir in /opt/data; do")
+	assert.NotContains(t, script, "for dir in /sandbox /opt/data; do")
+	assert.Contains(t, script, "chown root:sandbox /sandbox")
+}
+
+func TestBuildPrepareWritableRootsScript_DefaultTmpfs(t *testing.T) {
+	script := buildPrepareWritableRootsScript(nil)
+	assert.NotContains(t, script, "mount_pvc_disk")
+	assert.Contains(t, script, "for dir in /sandbox /opt/data; do")
+}
+
 // TestSandboxReconcile_ConditionsDoNotAccumulate verifies that reconciling a
 // ready sandbox many times does not grow the conditions slice. A bug
 // that appends instead of upserts the Ready condition will cause unbounded
@@ -4714,4 +4808,109 @@ func TestReconcileCoalescesNodeNameStatusWrite(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Get(t.Context(), req.NamespacedName, live))
 	assert.Equal(t, "node-2", live.Status.NodeName, "node changes on a Ready sandbox must be written immediately")
+
+func TestBuildCloudInitUserdata_SandboxCommandUsesProcessMode(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:  "sandbox",
+							Image: "hermes-sandbox-kubevirt:latest",
+							Env: []corev1.EnvVar{
+								{Name: "OPENSHELL_ENDPOINT", Value: "http://openshell.openshell.svc:8080"},
+								{Name: "OPENSHELL_SANDBOX_TOKEN", Value: "test-token"},
+								{Name: "OPENSHELL_SANDBOX_COMMAND", Value: "nemoclaw-start-vm"},
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	userdata := buildCloudInitUserdata(sandbox, nil)
+
+	assert.NotContains(t, userdata, "sandbox-workload")
+	assert.NotContains(t, userdata, "--mode=network")
+	assert.Contains(t, userdata, "ExecStart=/opt/openshell/bin/openshell-sandbox")
+	assert.Contains(t, userdata, "Environment=OPENSHELL_SANDBOX_COMMAND=nemoclaw-start-vm")
+	assert.Contains(t, userdata, "Environment=OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1")
+	assert.Contains(t, userdata, "Environment=OPENSHELL_SANDBOX_TOKEN_FILE=/etc/openshell/auth/sandbox.jwt")
+	assert.Contains(t, userdata, "path: /etc/openshell/prepare-writable-roots.sh")
+	assert.Contains(t, userdata, "openshell-sandbox-prepare.service")
+	assert.Contains(t, userdata, "Requires=openshell-sandbox-prepare.service")
+	assert.Contains(t, userdata, "chown root:sandbox /sandbox")
+	assert.Contains(t, userdata, "chown root:sandbox /sandbox/.hermes")
+	assert.Contains(t, userdata, "chmod 1775 /sandbox/.hermes")
+	assert.NotContains(t, userdata, "for f in config.yaml .config-hash SOUL.md")
+	assert.Contains(t, userdata, "for f in config.yaml SOUL.md")
+	assert.Contains(t, userdata, "for dir in /sandbox /opt/data; do")
+	assert.NotContains(t, userdata, "mount_pvc_disk")
+	assert.Contains(t, userdata, "kernel.printk")
+	assert.Contains(t, userdata, "99-openshell-quiet-console.conf")
+}
+
+func TestBuildCloudInitUserdata_VolumeClaimMounts(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:  "sandbox",
+							Image: "hermes-sandbox-kubevirt:latest",
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "sandbox-data", MountPath: "/sandbox"},
+							},
+							Env: []corev1.EnvVar{
+								{Name: "OPENSHELL_ENDPOINT", Value: "http://openshell.openshell.svc:8080"},
+							},
+						}},
+					},
+				},
+				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{
+					{EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "sandbox-data"}},
+				},
+			},
+		},
+	}
+
+	userdata := buildCloudInitUserdata(sandbox, nil)
+
+	assert.Contains(t, userdata, `mount_pvc_disk "sandboxdata" "/sandbox"`)
+	assert.Contains(t, userdata, "mkfs.ext4")
+	assert.Contains(t, userdata, "for dir in /opt/data; do")
+	assert.NotContains(t, userdata, "for dir in /sandbox /opt/data; do")
+}
+
+func TestBuildCloudInitUserdata_WithoutSandboxCommandOmitsPreserve(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "plain-vm"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name:  "sandbox",
+							Image: "fedora:latest",
+							Env: []corev1.EnvVar{
+								{Name: "OPENSHELL_ENDPOINT", Value: "http://openshell.openshell.svc:8080"},
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	userdata := buildCloudInitUserdata(sandbox, nil)
+
+	assert.NotContains(t, userdata, "OPENSHELL_SANDBOX_COMMAND")
+	assert.NotContains(t, userdata, "OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP")
+	assert.NotContains(t, userdata, "sandbox-workload")
+	assert.Contains(t, userdata, "ExecStart=/opt/openshell/bin/openshell-sandbox")
 }
