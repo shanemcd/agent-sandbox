@@ -15,6 +15,7 @@
 package controllers
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -25,24 +26,7 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
-func TestGatewayNamespaceFromEndpoint(t *testing.T) {
-	tests := []struct {
-		endpoint string
-		want     string
-	}{
-		{"https://openshell.openshell.svc.cluster.local:8080", "openshell"},
-		{"http://gw.gateway-ns.svc:8080", "gateway-ns"},
-		{"https://shortname:443", "openshell"},
-		{"openshell.myns.svc", "myns"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.endpoint, func(t *testing.T) {
-			assert.Equal(t, tt.want, gatewayNamespaceFromEndpoint(tt.endpoint))
-		})
-	}
-}
-
-func TestReadSandboxContainerEnv(t *testing.T) {
+func TestBuildSandboxEnvFile(t *testing.T) {
 	sandbox := &sandboxv1beta1.Sandbox{
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
@@ -50,138 +34,94 @@ func TestReadSandboxContainerEnv(t *testing.T) {
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{{
 							Env: []corev1.EnvVar{
-								{Name: "OPENSHELL_ENDPOINT", Value: "https://openshell.openshell.svc:8080"},
+								{Name: "FOO", Value: "bar"},
+								{Name: "QUOTED", Value: `hello "world"`},
+								{Name: "SPACED", Value: "a b"},
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	got := buildSandboxEnvFile(sandbox)
+	assert.Contains(t, got, "FOO=bar\n")
+	assert.Contains(t, got, `QUOTED="hello \"world\""`)
+	assert.Contains(t, got, `SPACED="a b"`)
+}
+
+func TestBuildSandboxVolumesJSON(t *testing.T) {
+	mounts := []vmVolumeMount{{
+		Name: "workspace", MountPath: "/sandbox", ClaimName: "workspace-hermes", Serial: "workspace",
+	}}
+	raw := buildSandboxVolumesJSON(mounts)
+	var metas []sandboxVolumeMeta
+	require.NoError(t, json.Unmarshal([]byte(raw), &metas))
+	require.Len(t, metas, 1)
+	assert.Equal(t, "workspace", metas[0].Name)
+	assert.Equal(t, "workspace", metas[0].Serial)
+	assert.Equal(t, "/sandbox", metas[0].MountPath)
+	assert.Equal(t, "workspace-hermes", metas[0].ClaimName)
+
+	empty := buildSandboxVolumesJSON(nil)
+	assert.Equal(t, "[]\n", empty)
+}
+
+func TestBuildCloudInitUserdata_GenericMetadataOnly(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sb"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Env: []corev1.EnvVar{
+								{Name: "OPENSHELL_ENDPOINT", Value: "http://gw.example:8080"},
+								{Name: "OPENSHELL_SANDBOX_COMMAND", Value: "nemoclaw-start-vm"},
 								{Name: "OPENSHELL_SANDBOX_TOKEN", Value: "tok"},
-								{Name: "OPENSHELL_SANDBOX_COMMAND", Value: "nemoclaw-start-vm"},
-								{Name: "OPENSHELL_SSH_AUTHORIZED_KEY", Value: "ssh-ed25519 AAAA"},
-								{Name: "CUSTOM", Value: "x"},
 							},
-						}},
-					},
-				},
-			},
-		},
-	}
-
-	env := readSandboxContainerEnv(sandbox)
-	assert.Equal(t, "https://openshell.openshell.svc:8080", env.Endpoint)
-	assert.Equal(t, "tok", env.SandboxToken)
-	assert.True(t, env.HasSandboxCommand)
-	assert.Equal(t, []string{"ssh-ed25519 AAAA"}, env.SSHAuthorizedKeys)
-	require.Len(t, env.Vars, 5)
-}
-
-func TestBuildPrepareWritableRootsScript_PVCMounts(t *testing.T) {
-	script := buildPrepareWritableRootsScript([]vmVolumeMount{{
-		Name: "sandbox-data", MountPath: "/sandbox", ClaimName: "sandbox-data-hermes", Serial: "sandboxdata",
-	}})
-
-	assert.Contains(t, script, "mount_pvc_disk")
-	assert.Contains(t, script, `mount_pvc_disk "sandboxdata" "/sandbox"`)
-	assert.Contains(t, script, "mkfs.ext4")
-	assert.Contains(t, script, `/dev/disk/by-id/virtio-${serial}`)
-	assert.Contains(t, script, ".workspace-initialized")
-	assert.Contains(t, script, "for dir in /opt/data; do")
-	assert.NotContains(t, script, "for dir in /sandbox /opt/data; do")
-	assert.Contains(t, script, "chown root:sandbox /sandbox")
-}
-
-func TestBuildPrepareWritableRootsScript_DefaultTmpfs(t *testing.T) {
-	script := buildPrepareWritableRootsScript(nil)
-	assert.NotContains(t, script, "mount_pvc_disk")
-	assert.Contains(t, script, "for dir in /sandbox /opt/data; do")
-}
-
-func TestBuildCloudInitUserdata_SandboxCommandUsesProcessMode(t *testing.T) {
-	sandbox := &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
-		Spec: sandboxv1beta1.SandboxSpec{
-			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{
-							Name:  "sandbox",
-							Image: "hermes-sandbox-kubevirt:latest",
-							Env: []corev1.EnvVar{
-								{Name: "OPENSHELL_ENDPOINT", Value: "http://openshell.openshell.svc:8080"},
-								{Name: "OPENSHELL_SANDBOX_TOKEN", Value: "test-token"},
-								{Name: "OPENSHELL_SANDBOX_COMMAND", Value: "nemoclaw-start-vm"},
-							},
-						}},
-					},
-				},
-			},
-		},
-	}
-
-	userdata := buildCloudInitUserdata(sandbox, nil, nil)
-
-	assert.NotContains(t, userdata, "sandbox-workload")
-	assert.NotContains(t, userdata, "--mode=network")
-	assert.Contains(t, userdata, "ExecStart=/opt/openshell/bin/openshell-sandbox")
-	assert.Contains(t, userdata, "Environment=OPENSHELL_SANDBOX_COMMAND=nemoclaw-start-vm")
-	assert.Contains(t, userdata, "Environment=OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP=1")
-	assert.Contains(t, userdata, "Environment=OPENSHELL_SANDBOX_TOKEN_FILE=/etc/openshell/auth/sandbox.jwt")
-	assert.Contains(t, userdata, "path: /etc/openshell/prepare-writable-roots.sh")
-	assert.Contains(t, userdata, "openshell-sandbox-prepare.service")
-	assert.Contains(t, userdata, "Requires=openshell-sandbox-prepare.service")
-	assert.Contains(t, userdata, "chown root:sandbox /sandbox")
-	assert.Contains(t, userdata, "chown root:sandbox /sandbox/.hermes")
-	assert.Contains(t, userdata, "chmod 1775 /sandbox/.hermes")
-	assert.NotContains(t, userdata, "for f in config.yaml .config-hash SOUL.md")
-	assert.Contains(t, userdata, "for f in config.yaml SOUL.md")
-	assert.Contains(t, userdata, "for dir in /sandbox /opt/data; do")
-	assert.NotContains(t, userdata, "mount_pvc_disk")
-	assert.Contains(t, userdata, "kernel.printk")
-	assert.Contains(t, userdata, "99-openshell-quiet-console.conf")
-}
-
-func TestBuildCloudInitUserdata_VolumeClaimMounts(t *testing.T) {
-	sandbox := &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
-		Spec: sandboxv1beta1.SandboxSpec{
-			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
-				PodTemplate: sandboxv1beta1.PodTemplate{
-					Spec: corev1.PodSpec{
-						Containers: []corev1.Container{{
-							Name:  "sandbox",
-							Image: "hermes-sandbox-kubevirt:latest",
 							VolumeMounts: []corev1.VolumeMount{
-								{Name: "sandbox-data", MountPath: "/sandbox"},
-							},
-							Env: []corev1.EnvVar{
-								{Name: "OPENSHELL_ENDPOINT", Value: "http://openshell.openshell.svc:8080"},
+								{Name: "workspace", MountPath: "/sandbox"},
 							},
 						}},
 					},
 				},
 				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{
-					{EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "sandbox-data"}},
+					{EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "workspace"}},
 				},
 			},
 		},
 	}
 
-	userdata := buildCloudInitUserdata(sandbox, nil, collectVMVolumeMounts(sandbox))
+	mounts := collectVMVolumeMounts(sandbox)
+	userdata := buildCloudInitUserdata(sandbox, mounts, nil)
 
-	assert.Contains(t, userdata, `mount_pvc_disk "sandboxdata" "/sandbox"`)
-	assert.Contains(t, userdata, "mkfs.ext4")
-	assert.Contains(t, userdata, "for dir in /opt/data; do")
-	assert.NotContains(t, userdata, "for dir in /sandbox /opt/data; do")
+	assert.Contains(t, userdata, "path: /etc/sandbox/env")
+	assert.Contains(t, userdata, "path: /etc/sandbox/volumes.json")
+	assert.Contains(t, userdata, "OPENSHELL_ENDPOINT=http://gw.example:8080")
+	assert.Contains(t, userdata, "OPENSHELL_SANDBOX_TOKEN=tok")
+	assert.Contains(t, userdata, `"serial":"workspace"`)
+	assert.Contains(t, userdata, `"mountPath":"/sandbox"`)
+
+	// Product-specific guest bootstrap must not live in the controller.
+	assert.NotContains(t, userdata, "openshell-sandbox.service")
+	assert.NotContains(t, userdata, "prepare-writable-roots")
+	assert.NotContains(t, userdata, "OPENSHELL_PRESERVE")
+	assert.NotContains(t, userdata, "hermes")
+	assert.NotContains(t, userdata, "runcmd:")
+	assert.NotContains(t, userdata, "users:")
 }
 
-func TestBuildCloudInitUserdata_WithoutSandboxCommandOmitsPreserve(t *testing.T) {
+func TestBuildCloudInitUserdata_ProjectsSecretFiles(t *testing.T) {
 	sandbox := &sandboxv1beta1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Name: "plain-vm"},
 		Spec: sandboxv1beta1.SandboxSpec{
 			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
 				PodTemplate: sandboxv1beta1.PodTemplate{
 					Spec: corev1.PodSpec{
 						Containers: []corev1.Container{{
-							Name:  "sandbox",
-							Image: "fedora:latest",
 							Env: []corev1.EnvVar{
-								{Name: "OPENSHELL_ENDPOINT", Value: "http://openshell.openshell.svc:8080"},
+								{Name: "OPENSHELL_TLS_CA", Value: "/etc/openshell-tls/client/ca.crt"},
 							},
 						}},
 					},
@@ -189,11 +129,48 @@ func TestBuildCloudInitUserdata_WithoutSandboxCommandOmitsPreserve(t *testing.T)
 			},
 		},
 	}
+	secretFiles := []cloudInitFile{{
+		Path:        "/etc/openshell-tls/client/ca.crt",
+		Permissions: "0400",
+		Content:     "-----BEGIN CERTIFICATE-----\nABC\n-----END CERTIFICATE-----\n",
+	}, {
+		Path:        "/etc/openshell-tls/client/tls.key",
+		Permissions: "0400",
+		Content:     "-----BEGIN PRIVATE KEY-----\nXYZ\n-----END PRIVATE KEY-----\n",
+	}}
 
-	userdata := buildCloudInitUserdata(sandbox, nil, nil)
+	userdata := buildCloudInitUserdata(sandbox, nil, secretFiles)
+	assert.Contains(t, userdata, "path: /etc/openshell-tls/client/ca.crt")
+	assert.Contains(t, userdata, `permissions: "0400"`)
+	assert.Contains(t, userdata, "-----BEGIN CERTIFICATE-----")
+	assert.Contains(t, userdata, "path: /etc/openshell-tls/client/tls.key")
+	assert.Contains(t, userdata, "OPENSHELL_TLS_CA=/etc/openshell-tls/client/ca.crt")
+	assert.NotContains(t, userdata, "openshell-sandbox.service")
+}
 
-	assert.NotContains(t, userdata, "OPENSHELL_SANDBOX_COMMAND")
-	assert.NotContains(t, userdata, "OPENSHELL_PRESERVE_SANDBOX_OWNERSHIP")
-	assert.NotContains(t, userdata, "sandbox-workload")
-	assert.Contains(t, userdata, "ExecStart=/opt/openshell/bin/openshell-sandbox")
+func TestSecretVolumeFiles(t *testing.T) {
+	mode := int32(0o400)
+	sec := &corev1.Secret{
+		Data: map[string][]byte{
+			"ca.crt":  []byte("CA"),
+			"tls.crt": []byte("CERT"),
+			"tls.key": []byte("KEY"),
+		},
+	}
+	src := &corev1.SecretVolumeSource{
+		SecretName:  "openshell-client-tls",
+		DefaultMode: &mode,
+		Items: []corev1.KeyToPath{
+			{Key: "ca.crt", Path: "ca.crt"},
+			{Key: "tls.crt", Path: "tls.crt"},
+			{Key: "tls.key", Path: "tls.key"},
+		},
+	}
+	files, err := secretVolumeFiles("/etc/openshell-tls/client", src, sec, "0400")
+	require.NoError(t, err)
+	require.Len(t, files, 3)
+	assert.Equal(t, "/etc/openshell-tls/client/ca.crt", files[0].Path)
+	assert.Equal(t, "0400", files[0].Permissions)
+	assert.Equal(t, "CA", files[0].Content)
+	assert.Equal(t, "KEY", files[2].Content)
 }

@@ -22,7 +22,7 @@ The introduction of **`volumeClaimTemplates`** into the `SandboxTemplate` API so
 2. When a `SandboxClaim` requests a sandbox from this template (or a `SandboxWarmPool` provisions a new one), the volume claim templates are seamlessly propagated to the individual `Sandbox` Custom Resources.
 3. The Sandbox controller then provisions the associated PVCs and attaches them to the workload:
    - **Pod backend (default):** merges the PVCs into the Pod spec and mounts them via container `volumeMounts`.
-   - **VirtualMachine backend:** attaches each claim referenced by a `volumeMount` on the first container as a virtio disk (serial = sanitized volume name) and mounts it in the guest at the declared `mountPath` on every boot. Paths that are PVC-backed skip the default tmpfs overlay used for writable roots.
+   - **VirtualMachine backend:** attaches each claim referenced by a `volumeMount` on the first container as a virtio disk (serial = sanitized volume name) and publishes mount metadata to the guest at `/etc/sandbox/volumes.json` via cloud-init. Secret volumes referenced by `volumeMount`s are projected into the guest as cloud-init `write_files` (same namespace Secret lookup as a Pod mount). Container env is written to `/etc/sandbox/env`. The guest image is responsible for formatting, mounting, and seeding claim disks; the controller does not run mount logic inside the VM.
 
 ---
 
