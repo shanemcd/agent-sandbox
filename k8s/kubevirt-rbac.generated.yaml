@@ -5,6 +5,18 @@ metadata:
   name: agent-sandbox-controller-kubevirt
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - serviceaccounts/token
+  verbs:
+  - create
+- apiGroups:
   - kubevirt.io
   resources:
   - virtualmachineinstances

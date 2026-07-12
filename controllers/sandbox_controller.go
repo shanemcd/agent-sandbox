@@ -265,12 +265,16 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.Info("Sandbox has expired, deleting child resources and checking shutdown policy")
 		sandboxDeleted, err = r.handleSandboxExpiry(ctx, sandbox)
 	} else {
-		err = r.reconcileChildResources(ctx, sandbox)
+		var childResult ctrl.Result
+		childResult, err = r.reconcileChildResources(ctx, sandbox)
 		expiredAfterReconcile, requeueAfter := checkSandboxExpiry(sandbox, time.Now())
 		result.RequeueAfter = requeueAfter
 		if expiredAfterReconcile {
 			setSandboxExpiredCondition(sandbox)
 			result.RequeueAfter = immediateRequeueDelay
+		} else if childResult.RequeueAfter > 0 &&
+			(result.RequeueAfter == 0 || childResult.RequeueAfter < result.RequeueAfter) {
+			result.RequeueAfter = childResult.RequeueAfter
 		}
 	}
 
@@ -285,11 +289,12 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return result, err
 }
 
-func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox *sandboxv1beta1.Sandbox) error {
+func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox *sandboxv1beta1.Sandbox) (ctrl.Result, error) {
 	// Create a hash from the sandbox.Name and use it as label value
 	nameHash := NameHash(sandbox.Name)
 
 	var allErrors error
+	result := ctrl.Result{}
 
 	// Reconcile PVCs from volumeClaimTemplates (common to both backends)
 	err := r.reconcilePVCs(ctx, sandbox, nameHash)
@@ -299,8 +304,10 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	var pod *corev1.Pod
 	var podErr error
 	if sandbox.Spec.RuntimeBackend == sandboxv1beta1.RuntimeBackendVirtualMachine {
-		err = r.reconcileVirtualMachine(ctx, sandbox, nameHash)
+		var vmResult ctrl.Result
+		vmResult, err = r.reconcileVirtualMachine(ctx, sandbox, nameHash)
 		allErrors = errors.Join(allErrors, err)
+		result = vmResult
 	} else {
 		// Default: Pod backend
 		pod, podErr = r.reconcilePod(ctx, sandbox, nameHash)
@@ -339,7 +346,7 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 		}
 	}
 
-	return allErrors
+	return result, allErrors
 }
 
 func (r *SandboxReconciler) computeConditions(sandbox *sandboxv1beta1.Sandbox, err error, svc *corev1.Service, pod *corev1.Pod, podErr error) []metav1.Condition {

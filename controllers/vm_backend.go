@@ -246,16 +246,27 @@ func appendVMSecretDisks(disks []vmDisk, volumes []vmVolume, mounts []vmSecretMo
 	return disks, volumes
 }
 
-func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string) error {
+func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
 	ctx, end := r.Tracer.StartSpan(ctx, nil, "reconcileVirtualMachine", nil)
 	defer end()
 
 	vmName := sandbox.Name
+	result := ctrl.Result{}
 
 	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
-		return r.suspendVirtualMachine(ctx, sandbox, vmName)
+		return result, r.suspendVirtualMachine(ctx, sandbox, vmName)
+	}
+
+	// Mint/refresh the BoundObjectRef SA token Secret before creating the VM
+	// so the guest can IssueSandboxToken on first boot and after reboot.
+	if wantsOpenshellSABootstrap(sandbox) {
+		requeue, err := r.reconcileOpenshellSABootstrap(ctx, sandbox, nameHash)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		result.RequeueAfter = requeue
 	}
 
 	vm := &unstructured.Unstructured{}
@@ -263,22 +274,22 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 	err := r.Get(ctx, types.NamespacedName{Name: vmName, Namespace: sandbox.Namespace}, vm)
 	if err != nil {
 		if !k8serrors.IsNotFound(err) {
-			return fmt.Errorf("failed to get VirtualMachine: %w", err)
+			return ctrl.Result{}, fmt.Errorf("failed to get VirtualMachine: %w", err)
 		}
 		logger.Info("Creating VirtualMachine", "VM.Name", vmName)
 
 		pvcMounts := collectVMVolumeMounts(sandbox)
 		secretMounts := collectVMSecretMounts(sandbox)
 		if err := r.createSandboxMetaSecret(ctx, sandbox, nameHash, pvcMounts, secretMounts); err != nil {
-			return err
+			return ctrl.Result{}, err
 		}
 		if err := r.createVirtualMachine(ctx, sandbox, vmName, nameHash, pvcMounts, secretMounts); err != nil {
-			return err
+			return ctrl.Result{}, err
 		}
 
 		setVMReadyCondition(sandbox, false, sandboxv1beta1.SandboxReasonDependenciesNotReady,
 			"VirtualMachine created, waiting for VMI to become Running")
-		return nil
+		return result, nil
 	}
 
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
@@ -287,11 +298,11 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 		patch := client.MergeFrom(vm.DeepCopy())
 		_ = unstructured.SetNestedField(vm.Object, true, "spec", "running")
 		if err := r.Patch(ctx, vm, patch); err != nil {
-			return fmt.Errorf("failed to patch VM running=true: %w", err)
+			return ctrl.Result{}, fmt.Errorf("failed to patch VM running=true: %w", err)
 		}
 	}
 
-	return r.updateStatusFromVMI(ctx, sandbox, vmName)
+	return result, r.updateStatusFromVMI(ctx, sandbox, vmName)
 }
 
 func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName, nameHash string, pvcMounts []vmVolumeMount, secretMounts []vmSecretMount) error {

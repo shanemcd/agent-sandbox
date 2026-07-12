@@ -27,6 +27,69 @@ import (
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
 
+func TestWantsOpenshellSABootstrap(t *testing.T) {
+	mode := int32(0400)
+	withSA := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name: "sandbox",
+							VolumeMounts: []corev1.VolumeMount{{
+								Name:      "openshell-sa-token",
+								MountPath: "/var/run/secrets/openshell",
+							}},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "openshell-sa-token",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName:  "hermes-openshell-sa-token",
+									DefaultMode: &mode,
+								},
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+	assert.True(t, wantsOpenshellSABootstrap(withSA))
+
+	tlsOnly := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name: "sandbox",
+							VolumeMounts: []corev1.VolumeMount{{
+								Name:      "openshell-client-tls",
+								MountPath: "/etc/openshell-tls/client",
+							}},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "openshell-client-tls",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{SecretName: "openshell-client-tls"},
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+	assert.False(t, wantsOpenshellSABootstrap(tlsOnly))
+}
+
+func TestOpenshellSATokenNames(t *testing.T) {
+	assert.Equal(t, "hermes-openshell-sa-token", openshellSATokenSecretName("hermes"))
+	assert.Equal(t, "hermes-openshell-bootstrap", openshellBootstrapPodName("hermes"))
+}
+
 func TestVirtioDiskSerial(t *testing.T) {
 	assert.Equal(t, "agentdata", virtioDiskSerial("agent-data"))
 	assert.Equal(t, "sandbox", virtioDiskSerial("sandbox"))

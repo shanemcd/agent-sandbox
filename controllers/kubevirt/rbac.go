@@ -19,3 +19,7 @@
 package kubevirt
 
 //+kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines;virtualmachineinstances,verbs=get;list;watch;create;update;patch;delete
+// OpenShell VM SA bootstrap: TokenRequest bound to a companion Pod, written
+// into a Secret virtio disk for guest IssueSandboxToken / rebootstrap.
+//+kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get
+//+kubebuilder:rbac:groups="",resources=serviceaccounts/token,verbs=create
