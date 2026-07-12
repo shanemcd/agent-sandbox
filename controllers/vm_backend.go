@@ -130,7 +130,7 @@ type vmDiskBus struct {
 type vmVolume struct {
 	Name                  string           `json:"name"`
 	ContainerDisk         *vmContainerDisk `json:"containerDisk,omitempty"`
-	CloudInitNoCloud      *vmCloudInit     `json:"cloudInitNoCloud,omitempty"`
+	Secret                *vmSecretVolume  `json:"secret,omitempty"`
 	PersistentVolumeClaim *vmPVCVolume     `json:"persistentVolumeClaim,omitempty"`
 }
 
@@ -138,12 +138,10 @@ type vmContainerDisk struct {
 	Image string `json:"image"`
 }
 
-type vmCloudInit struct {
-	SecretRef vmLocalObjectRef `json:"secretRef"`
-}
-
-type vmLocalObjectRef struct {
-	Name string `json:"name"`
+// vmSecretVolume is the KubeVirt Secret volume source (files as virtio disk).
+type vmSecretVolume struct {
+	SecretName  string `json:"secretName"`
+	DefaultMode *int32 `json:"defaultMode,omitempty"`
 }
 
 type vmPVCVolume struct {
@@ -220,11 +218,30 @@ func pvcVolume(name, claimName string) vmVolume {
 	}
 }
 
+func secretVolume(name, secretName string, defaultMode *int32) vmVolume {
+	return vmVolume{
+		Name: name,
+		Secret: &vmSecretVolume{
+			SecretName:  secretName,
+			DefaultMode: defaultMode,
+		},
+	}
+}
+
 // appendVMClaimDisks appends virtio disks and PVC volumes for the given mounts.
 func appendVMClaimDisks(disks []vmDisk, volumes []vmVolume, mounts []vmVolumeMount) ([]vmDisk, []vmVolume) {
 	for _, m := range mounts {
 		disks = append(disks, virtioDisk(m.Name, m.Serial))
 		volumes = append(volumes, pvcVolume(m.Name, m.ClaimName))
+	}
+	return disks, volumes
+}
+
+// appendVMSecretDisks appends virtio disks and Secret volumes for Secret mounts.
+func appendVMSecretDisks(disks []vmDisk, volumes []vmVolume, mounts []vmSecretMount) ([]vmDisk, []vmVolume) {
+	for _, m := range mounts {
+		disks = append(disks, virtioDisk(m.Name, m.Serial))
+		volumes = append(volumes, secretVolume(m.Name, m.SecretName, m.DefaultMode))
 	}
 	return disks, volumes
 }
@@ -236,7 +253,6 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 	defer end()
 
 	vmName := sandbox.Name
-	secretName := vmName + "-cloudinit"
 
 	if sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
 		return r.suspendVirtualMachine(ctx, sandbox, vmName)
@@ -251,11 +267,12 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 		}
 		logger.Info("Creating VirtualMachine", "VM.Name", vmName)
 
-		mounts := collectVMVolumeMounts(sandbox)
-		if err := r.createCloudInitSecret(ctx, sandbox, secretName, nameHash, mounts); err != nil {
+		pvcMounts := collectVMVolumeMounts(sandbox)
+		secretMounts := collectVMSecretMounts(sandbox)
+		if err := r.createSandboxMetaSecret(ctx, sandbox, nameHash, pvcMounts, secretMounts); err != nil {
 			return err
 		}
-		if err := r.createVirtualMachine(ctx, sandbox, vmName, secretName, nameHash, mounts); err != nil {
+		if err := r.createVirtualMachine(ctx, sandbox, vmName, nameHash, pvcMounts, secretMounts); err != nil {
 			return err
 		}
 
@@ -277,10 +294,10 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 	return r.updateStatusFromVMI(ctx, sandbox, vmName)
 }
 
-func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName, secretName, nameHash string, mounts []vmVolumeMount) error {
+func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName, nameHash string, pvcMounts []vmVolumeMount, secretMounts []vmSecretMount) error {
 	logger := log.FromContext(ctx)
 
-	vm, err := buildVirtualMachineObject(sandbox, vmName, secretName, nameHash, mounts)
+	vm, err := buildVirtualMachineObject(sandbox, vmName, nameHash, pvcMounts, secretMounts)
 	if err != nil {
 		return err
 	}
@@ -318,27 +335,23 @@ func vmLabels(sandbox *sandboxv1beta1.Sandbox, nameHash string) map[string]strin
 
 // buildVirtualMachineObject constructs the VirtualMachine for create using typed
 // local structs, then converts once to unstructured for the dynamic client.
-func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName, secretName, nameHash string, mounts []vmVolumeMount) (*unstructured.Unstructured, error) {
+func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName, nameHash string, pvcMounts []vmVolumeMount, secretMounts []vmSecretMount) (*unstructured.Unstructured, error) {
 	image := vmContainerImage(sandbox)
 	labels := vmLabels(sandbox, nameHash)
 
 	disks := []vmDisk{
 		virtioDisk("containerdisk", ""),
-		virtioDisk("cloudinitdisk", ""),
+		virtioDisk(sandboxMetaVolumeName, sandboxMetaSerial),
 	}
 	volumes := []vmVolume{
 		{
 			Name:          "containerdisk",
 			ContainerDisk: &vmContainerDisk{Image: image},
 		},
-		{
-			Name: "cloudinitdisk",
-			CloudInitNoCloud: &vmCloudInit{
-				SecretRef: vmLocalObjectRef{Name: secretName},
-			},
-		},
+		secretVolume(sandboxMetaVolumeName, sandboxMetaSecretName(sandbox.Name), nil),
 	}
-	disks, volumes = appendVMClaimDisks(disks, volumes, mounts)
+	disks, volumes = appendVMClaimDisks(disks, volumes, pvcMounts)
+	disks, volumes = appendVMSecretDisks(disks, volumes, secretMounts)
 
 	typed := kubevirtVirtualMachine{
 		APIVersion: kubevirtVMGVK.GroupVersion().String(),

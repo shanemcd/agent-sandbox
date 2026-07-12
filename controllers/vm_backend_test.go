@@ -106,7 +106,27 @@ func TestAppendVMClaimDisks(t *testing.T) {
 	require.Len(t, v2, 1)
 }
 
+func TestAppendVMSecretDisks(t *testing.T) {
+	mode := int32(0o400)
+	disks := []vmDisk{virtioDisk("containerdisk", "")}
+	volumes := []vmVolume{{Name: "containerdisk"}}
+	mounts := []vmSecretMount{{
+		Name: "openshell-client-tls", MountPath: "/etc/openshell-tls/client",
+		SecretName: "openshell-client-tls", Serial: "openshellclienttls", DefaultMode: &mode,
+	}}
+
+	disks, volumes = appendVMSecretDisks(disks, volumes, mounts)
+	require.Len(t, disks, 2)
+	require.Len(t, volumes, 2)
+	assert.Equal(t, "openshellclienttls", disks[1].Serial)
+	require.NotNil(t, volumes[1].Secret)
+	assert.Equal(t, "openshell-client-tls", volumes[1].Secret.SecretName)
+	require.NotNil(t, volumes[1].Secret.DefaultMode)
+	assert.Equal(t, int32(0o400), *volumes[1].Secret.DefaultMode)
+}
+
 func TestBuildVirtualMachineObject(t *testing.T) {
+	mode := int32(0o400)
 	sandbox := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{Name: "hermes", Namespace: "default"},
 		Spec: sandboxv1beta1.SandboxSpec{
@@ -118,6 +138,16 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 							Image: "hermes:latest",
 							VolumeMounts: []corev1.VolumeMount{
 								{Name: "sandbox-data", MountPath: "/sandbox"},
+								{Name: "openshell-client-tls", MountPath: "/etc/openshell-tls/client"},
+							},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "openshell-client-tls",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName:  "openshell-client-tls",
+									DefaultMode: &mode,
+								},
 							},
 						}},
 					},
@@ -129,26 +159,45 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 		},
 	}
 
-	u, err := buildVirtualMachineObject(sandbox, "hermes", "hermes-cloudinit", "hash", collectVMVolumeMounts(sandbox))
+	pvcMounts := collectVMVolumeMounts(sandbox)
+	secretMounts := collectVMSecretMounts(sandbox)
+	u, err := buildVirtualMachineObject(sandbox, "hermes", "hash", pvcMounts, secretMounts)
 	require.NoError(t, err)
 	assert.Equal(t, kubevirtVMGVK, u.GroupVersionKind())
 
 	vols, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "volumes")
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Len(t, vols, 3)
+	require.Len(t, vols, 4)
 
 	containerDisk := vols[0].(map[string]interface{})
 	assert.Equal(t, "hermes:latest", containerDisk["containerDisk"].(map[string]interface{})["image"])
+
+	metaVol := vols[1].(map[string]interface{})
+	assert.Equal(t, "hermes-meta", metaVol["secret"].(map[string]interface{})["secretName"])
+	_, hasCloudInit := metaVol["cloudInitNoCloud"]
+	assert.False(t, hasCloudInit)
 
 	claimVol := vols[2].(map[string]interface{})
 	assert.Equal(t, "sandbox-data-hermes",
 		claimVol["persistentVolumeClaim"].(map[string]interface{})["claimName"])
 
+	secretVol := vols[3].(map[string]interface{})
+	assert.Equal(t, "openshell-client-tls",
+		secretVol["secret"].(map[string]interface{})["secretName"])
+
 	disks, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "domain", "devices", "disks")
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Len(t, disks, 3)
+	require.Len(t, disks, 4)
+
+	metaDisk := disks[1].(map[string]interface{})
+	assert.Equal(t, sandboxMetaSerial, metaDisk["serial"])
+	assert.Equal(t, sandboxMetaVolumeName, metaDisk["name"])
+
 	claimDisk := disks[2].(map[string]interface{})
 	assert.Equal(t, "sandboxdata", claimDisk["serial"])
+
+	secretDisk := disks[3].(map[string]interface{})
+	assert.Equal(t, "openshellclienttls", secretDisk["serial"])
 }
