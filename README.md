@@ -112,6 +112,9 @@ kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/downl
 
 # Extensions (opt-in):
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/extensions.yaml
+
+# KubeVirt VirtualMachine backend RBAC (opt-in; requires KubeVirt in the cluster):
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/kubevirt.yaml
 ```
 
 ### Go SDK

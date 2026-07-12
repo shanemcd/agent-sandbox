@@ -58,6 +58,11 @@ To run the controller on a local `kind` cluster, use the following command:
 make deploy-kind
 ```
 
+Optional flags:
+
+* `EXTENSIONS=true make deploy-kind` — deploy with extensions controllers enabled.
+* `KUBEVIRT=true make deploy-kind` — apply optional KubeVirt RBAC for `runtimeBackend: VirtualMachine` sandboxes.
+
 This command will:
 
 1.  Create a `kind` cluster named `agent-sandbox` if it doesn't already exist.

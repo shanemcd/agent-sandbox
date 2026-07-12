@@ -32,6 +32,8 @@ controller:
   leaderElect: true
   # leaderElectionNamespace: ""
   extensions: false
+  # Bind optional KubeVirt RBAC for runtimeBackend: VirtualMachine sandboxes.
+  kubevirt: false
   # enableTracing: false
   # enablePprof: false
   # enablePprofDebug: false

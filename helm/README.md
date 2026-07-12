@@ -26,6 +26,18 @@ helm install agent-sandbox ./helm/ \
   --set controller.extensions=true
 ```
 
+### Install with KubeVirt VirtualMachine backend RBAC
+
+Pod-only installs do not need KubeVirt permissions. Enable this when creating Sandboxes with `runtimeBackend: VirtualMachine` (requires KubeVirt installed in the cluster).
+
+```bash
+helm install agent-sandbox ./helm/ \
+  --namespace agent-sandbox-system \
+  --create-namespace \
+  --set image.tag=<version> \
+  --set controller.kubevirt=true
+```
+
 ### Install into an existing namespace
 
 ```bash
@@ -101,6 +113,7 @@ The following table lists the configurable parameters and their defaults.
 | `controller.pprofMutexProfileFraction` | Mutex contention sampling rate when pprof debug is enabled | `10` |
 | `controller.extraArgs` | Additional flags not listed above (e.g. zap logging flags) | `[]` |
 | `controller.extensions` | Enable extensions controller (WarmPool, Template, Claim) | `false` |
+| `controller.kubevirt` | Bind optional KubeVirt RBAC for VirtualMachine sandboxes | `false` |
 | `resources` | CPU/memory resource requests and limits | `{}` |
 | `nodeSelector` | Node selector for the controller pod | `{}` |
 | `tolerations` | Tolerations for the controller pod | `[]` |

@@ -17,6 +17,16 @@ The `agent-sandbox-controller` supports several command-line flags to tune perfo
   construct service FQDNs. Only change this if your cluster is configured with a non-default
   domain (e.g. `my-company.local`).
 
+## VirtualMachine backend (KubeVirt)
+
+Sandboxes with `runtimeBackend: VirtualMachine` need the optional KubeVirt ClusterRole bound to the controller ServiceAccount. Pod-only installs should leave this disabled so the default ClusterRole does not include `kubevirt.io` permissions.
+
+* Manifests: apply `kubevirt.yaml` from the release (or `k8s/kubevirt-rbac.generated.yaml` + `k8s/kubevirt.yaml`).
+* Kind: `KUBEVIRT=true make deploy-kind`
+* Helm: `--set controller.kubevirt=true`
+
+KubeVirt itself must already be installed in the cluster.
+
 ## Deployment Example
 
 To deploy the controller with custom concurrency settings, modify the `args` of the `agent-sandbox-controller` container within the project's installation manifests. 

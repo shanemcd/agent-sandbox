@@ -149,6 +149,21 @@ class CheckInstallManifestDriftTest(unittest.TestCase):
             k8s_dir="k8s",
         )
 
+    def test_kubevirt_files_are_excluded(self):
+        # Optional KubeVirt RBAC is a separate release asset and must not be
+        # required in kustomization.yaml / sandbox-with-extensions.yaml.
+        kpath = self._kustomization("controller.yaml", "extensions.yaml")
+        release.check_install_manifest_drift(
+            [
+                "k8s/controller.yaml",
+                "k8s/extensions.yaml",
+                "k8s/kubevirt-rbac.generated.yaml",
+                "k8s/kubevirt.yaml",
+            ],
+            kustomization_path=kpath,
+            k8s_dir="k8s",
+        )
+
     def test_missing_file_is_drift(self):
         kpath = self._kustomization("controller.yaml")
         with self.assertRaises(SystemExit):

@@ -125,6 +125,11 @@ def check_install_manifest_drift(
     """
     globbed = {os.path.relpath(f, k8s_dir) for f in all_yaml_files}
     globbed.discard("extensions.controller.yaml")
+    # Optional KubeVirt RBAC is applied separately (like a feature overlay) and
+    # is not part of sandbox-with-extensions.yaml.
+    for name in list(globbed):
+        if "kubevirt" in os.path.basename(name):
+            globbed.discard(name)
     listed = _kustomization_resource_paths(kustomization_path)
 
     missing = globbed - listed
@@ -174,9 +179,19 @@ def main():
             text,
         )
 
+    def is_extensions_file(path):
+        return "extensions" in os.path.basename(path)
+
+    def is_kubevirt_file(path):
+        return "kubevirt" in os.path.basename(path)
+
     # --- Generate sandbox.yaml (core only) ---
     print("INFO: Preparing core sandbox.yaml")
-    core_files = [f for f in all_yaml_files if "extensions" not in os.path.basename(f)]
+    core_files = [
+        f
+        for f in all_yaml_files
+        if not is_extensions_file(f) and not is_kubevirt_file(f)
+    ]
     with open("release_assets/sandbox.yaml", "w") as outfile:
         for fname in sorted(core_files):
             with open(fname) as infile:
@@ -196,7 +211,7 @@ def main():
 
     # --- Generate extensions.yaml ---
     print("INFO: Preparing extensions.yaml")
-    extension_files = [f for f in all_yaml_files if "extensions" in os.path.basename(f)]
+    extension_files = [f for f in all_yaml_files if is_extensions_file(f)]
     with open("release_assets/extensions.yaml", "w") as outfile:
         for fname in sorted(extension_files):
             with open(fname) as infile:
@@ -213,6 +228,16 @@ def main():
     with open("release_assets/extensions.yaml", "w") as file:
         file.write(filedata)
     print("INFO: Successfully created release_assets/extensions.yaml")
+
+    # --- Generate kubevirt.yaml (optional VirtualMachine backend RBAC) ---
+    print("INFO: Preparing kubevirt.yaml")
+    kubevirt_files = [f for f in all_yaml_files if is_kubevirt_file(f)]
+    with open("release_assets/kubevirt.yaml", "w") as outfile:
+        for fname in sorted(kubevirt_files):
+            with open(fname) as infile:
+                outfile.write(infile.read())
+                outfile.write("---\n")
+    print("INFO: Successfully created release_assets/kubevirt.yaml")
 
     # --- Generate sandbox-with-extensions.yaml (all-in-one, kustomize/GitOps friendly) ---
     # sandbox.yaml + extensions.yaml both declare the controller Deployment and
@@ -252,10 +277,12 @@ def main():
         print(f"INFO: Publishing draft release {tag} to GitHub...")
         core_path = "release_assets/sandbox.yaml"
         extensions_path = "release_assets/extensions.yaml"
+        kubevirt_path = "release_assets/kubevirt.yaml"
         all_in_one_path = "release_assets/sandbox-with-extensions.yaml"
 
         if not all(
-            os.path.exists(p) for p in (core_path, extensions_path, all_in_one_path)
+            os.path.exists(p)
+            for p in (core_path, extensions_path, kubevirt_path, all_in_one_path)
         ):
             print("❌ Release assets missing. Cannot publish.")
             sys.exit(1)
@@ -275,6 +302,7 @@ def main():
                 "gh", "release", "upload", tag,
                 core_path,
                 extensions_path,
+                kubevirt_path,
                 all_in_one_path,
                 "--clobber",
                 "--repo", "kubernetes-sigs/agent-sandbox",
@@ -303,6 +331,7 @@ def main():
                 "gh", "release", "create", tag,
                 core_path,
                 extensions_path,
+                kubevirt_path,
                 all_in_one_path,
             ]
 

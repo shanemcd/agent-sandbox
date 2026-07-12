@@ -184,7 +184,10 @@ def process_manifests(all_docs, args):
         kind = item["kind"]
 
         is_extension_file = filename.startswith("extensions")
+        is_kubevirt_file = filename.startswith("kubevirt")
         if is_extension_file and not args.extensions:
+            continue
+        if is_kubevirt_file and not args.kubevirt:
             continue
 
         # When extensions is enabled, we skip the core controller manifest because
@@ -270,6 +273,9 @@ if __name__ == "__main__":
     parser.add_argument("--extensions",
                         action="store_true",
                         help="Apply the extensions controller manifest. This flag must be set to deploy extensions.")
+    parser.add_argument("--kubevirt",
+                        action="store_true",
+                        help="Apply optional KubeVirt RBAC for the VirtualMachine runtime backend.")
     parser.add_argument("--controller-args",
                         dest="controller_args",
                         help="Space-separated flags to pass to the controller container. Example " \

@@ -19,11 +19,16 @@ package agentsandbox
 // Generate CRDs and RBAC rules
 //go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen object crd:maxDescLen=0 paths=./api/... output:crd:dir=k8s/crds
 //go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen object crd:maxDescLen=0 paths=./extensions/... output:crd:dir=k8s/crds
-//go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./controllers/... output:rbac:dir=k8s rbac:roleName=agent-sandbox-controller,fileName=rbac.generated.yaml
+// Core Sandbox controller RBAC (Pod backend). paths=./controllers excludes the
+// optional controllers/kubevirt package so kubevirt.io rules are not in the
+// default ClusterRole.
+//go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./controllers output:rbac:dir=k8s rbac:roleName=agent-sandbox-controller,fileName=rbac.generated.yaml
+//go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./controllers/kubevirt output:rbac:dir=k8s rbac:roleName=agent-sandbox-controller-kubevirt,fileName=kubevirt-rbac.generated.yaml
 //go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./extensions/controllers/... output:rbac:dir=k8s rbac:roleName=agent-sandbox-controller-extensions,fileName=extensions-rbac.generated.yaml
 //go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen object crd:maxDescLen=0 paths=./api/... output:crd:dir=helm/crds
 //go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen object crd:maxDescLen=0 paths=./extensions/... output:crd:dir=helm/crds
-//go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./controllers/... output:rbac:dir=helm/templates rbac:roleName=agent-sandbox-controller,fileName=rbac.generated.yaml
+//go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./controllers output:rbac:dir=helm/templates rbac:roleName=agent-sandbox-controller,fileName=rbac.generated.yaml
+//go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./controllers/kubevirt output:rbac:dir=helm/templates rbac:roleName=agent-sandbox-controller-kubevirt,fileName=kubevirt-rbac.generated.yaml
 //go:generate go tool -modfile=tools.mod sigs.k8s.io/controller-tools/cmd/controller-gen paths=./extensions/controllers/... output:rbac:dir=helm/templates rbac:roleName=agent-sandbox-controller-extensions,fileName=extensions-rbac.generated.yaml
 //go:generate ./dev/tools/sort-crd-versions
 //go:generate ./dev/tools/client-gen-go.sh

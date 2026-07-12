@@ -24,6 +24,8 @@ The introduction of **`volumeClaimTemplates`** into the `SandboxTemplate` API so
    - **Pod backend (default):** merges the PVCs into the Pod spec and mounts them via container `volumeMounts`.
    - **VirtualMachine backend:** attaches each claim referenced by a `volumeMount` on the first container as a virtio disk (serial = sanitized volume name). Guest metadata is delivered as a KubeVirt Secret volume with fixed virtio serial `sandboxmeta` (Secret `<sandboxName>-meta`, keys `env` and `volumes.json`). Secret volumes referenced by `volumeMount`s on the first container are attached as additional Secret virtio disks and listed in `volumes.json` with `source: secret`. The metadata disk itself is not listed in `volumes.json`. The guest image is responsible for mounting disks (for example via `/dev/disk/by-id/virtio-*`); the controller does not assume cloud-init or run mount logic inside the VM.
 
+KubeVirt permissions are **not** in the default controller ClusterRole. Installs that use `runtimeBackend: VirtualMachine` must also apply the optional KubeVirt RBAC (`kubevirt.yaml` from the release, `KUBEVIRT=true make deploy-kind`, or Helm `--set controller.kubevirt=true`).
+
 ---
 
 ### Create a SandboxTemplate with Volume Claims
