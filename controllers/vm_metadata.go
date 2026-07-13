@@ -39,8 +39,9 @@ const (
 	sandboxMetaEnvKey     = "env"
 	sandboxMetaVolumesKey = "volumes.json"
 
-	vmVolumeSourcePVC    = "persistentVolumeClaim"
-	vmVolumeSourceSecret = "secret"
+	vmVolumeSourcePVC      = "persistentVolumeClaim"
+	vmVolumeSourceSecret   = "secret"
+	vmVolumeSourceVirtiofs = "virtiofs"
 )
 
 // sandboxVolumeMeta is the machine-readable volume mount contract for guests.
@@ -189,11 +190,15 @@ func buildSandboxVolumesJSON(pvcMounts []vmVolumeMount, secretMounts []vmSecretM
 		})
 	}
 	for _, m := range secretMounts {
+		source := vmVolumeSourceSecret
+		if wantsSecretVirtiofs(m) {
+			source = vmVolumeSourceVirtiofs
+		}
 		metas = append(metas, sandboxVolumeMeta{
 			Name:       m.Name,
 			Serial:     m.Serial,
 			MountPath:  m.MountPath,
-			Source:     vmVolumeSourceSecret,
+			Source:     source,
 			SecretName: m.SecretName,
 		})
 	}

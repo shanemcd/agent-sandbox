@@ -55,19 +55,28 @@ func TestBuildSandboxVolumesJSON(t *testing.T) {
 	pvc := []vmVolumeMount{{
 		Name: "workspace", MountPath: "/sandbox", ClaimName: "workspace-hermes", Serial: "workspace",
 	}}
-	secrets := []vmSecretMount{{
-		Name: "openshell-client-tls", MountPath: "/etc/openshell-tls/client",
-		SecretName: "openshell-client-tls", Serial: "openshellclienttls",
-	}}
+	secrets := []vmSecretMount{
+		{
+			Name: "openshell-client-tls", MountPath: "/etc/openshell-tls/client",
+			SecretName: "openshell-client-tls", Serial: "openshellclienttls",
+		},
+		{
+			Name: openshellSATokenVolumeName, MountPath: "/var/run/secrets/openshell",
+			SecretName: "hermes-openshell-sa-token", Serial: "openshellsatoken",
+		},
+	}
 	raw := buildSandboxVolumesJSON(pvc, secrets)
 	var metas []sandboxVolumeMeta
 	require.NoError(t, json.Unmarshal([]byte(raw), &metas))
-	require.Len(t, metas, 2)
+	require.Len(t, metas, 3)
 	assert.Equal(t, vmVolumeSourcePVC, metas[0].Source)
 	assert.Equal(t, "workspace-hermes", metas[0].ClaimName)
 	assert.Equal(t, vmVolumeSourceSecret, metas[1].Source)
 	assert.Equal(t, "openshell-client-tls", metas[1].SecretName)
 	assert.Equal(t, "openshellclienttls", metas[1].Serial)
+	assert.Equal(t, vmVolumeSourceVirtiofs, metas[2].Source)
+	assert.Equal(t, openshellSATokenVolumeName, metas[2].Name)
+	assert.Equal(t, "hermes-openshell-sa-token", metas[2].SecretName)
 
 	empty := buildSandboxVolumesJSON(nil, nil)
 	assert.Equal(t, "[]\n", empty)

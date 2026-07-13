@@ -163,8 +163,15 @@ type vmDomainCPU struct {
 }
 
 type vmDomainDevices struct {
-	Disks      []vmDisk      `json:"disks"`
-	Interfaces []vmInterface `json:"interfaces"`
+	Disks        []vmDisk        `json:"disks"`
+	Filesystems  []vmFilesystem  `json:"filesystems,omitempty"`
+	Interfaces   []vmInterface   `json:"interfaces"`
+}
+
+// vmFilesystem is a KubeVirt virtiofs share (Secret/ConfigMap hot-refresh path).
+type vmFilesystem struct {
+	Name    string         `json:"name"`
+	Virtiofs map[string]any `json:"virtiofs"`
 }
 
 type vmDomainResources struct {
@@ -237,13 +244,40 @@ func appendVMClaimDisks(disks []vmDisk, volumes []vmVolume, mounts []vmVolumeMou
 	return disks, volumes
 }
 
-// appendVMSecretDisks appends virtio disks and Secret volumes for Secret mounts.
+// appendVMSecretDisks appends virtio ISO disks and Secret volumes for Secret
+// mounts that are not delivered via virtiofs (see appendVMSecretFilesystems).
 func appendVMSecretDisks(disks []vmDisk, volumes []vmVolume, mounts []vmSecretMount) ([]vmDisk, []vmVolume) {
 	for _, m := range mounts {
+		if wantsSecretVirtiofs(m) {
+			continue
+		}
 		disks = append(disks, virtioDisk(m.Name, m.Serial))
 		volumes = append(volumes, secretVolume(m.Name, m.SecretName, m.DefaultMode))
 	}
 	return disks, volumes
+}
+
+// wantsSecretVirtiofs is true for the OpenShell SA bootstrap token. KubeVirt
+// Secret-as-disk ISOs do not propagate updates into a running VMI; virtiofs
+// does (same idea as kubelet projected volumes for Pods).
+func wantsSecretVirtiofs(m vmSecretMount) bool {
+	return m.Name == openshellSATokenVolumeName
+}
+
+// appendVMSecretFilesystems appends virtiofs filesystem devices and Secret
+// volumes for mounts that need live Secret update propagation.
+func appendVMSecretFilesystems(filesystems []vmFilesystem, volumes []vmVolume, mounts []vmSecretMount) ([]vmFilesystem, []vmVolume) {
+	for _, m := range mounts {
+		if !wantsSecretVirtiofs(m) {
+			continue
+		}
+		filesystems = append(filesystems, vmFilesystem{
+			Name:    m.Name,
+			Virtiofs: map[string]any{},
+		})
+		volumes = append(volumes, secretVolume(m.Name, m.SecretName, m.DefaultMode))
+	}
+	return filesystems, volumes
 }
 
 func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string) (ctrl.Result, error) {
@@ -363,6 +397,8 @@ func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName, nameHash
 	}
 	disks, volumes = appendVMClaimDisks(disks, volumes, pvcMounts)
 	disks, volumes = appendVMSecretDisks(disks, volumes, secretMounts)
+	var filesystems []vmFilesystem
+	filesystems, volumes = appendVMSecretFilesystems(filesystems, volumes, secretMounts)
 
 	typed := kubevirtVirtualMachine{
 		APIVersion: kubevirtVMGVK.GroupVersion().String(),
@@ -380,7 +416,8 @@ func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName, nameHash
 					Domain: vmDomain{
 						CPU: vmDomainCPU{Cores: 2},
 						Devices: vmDomainDevices{
-							Disks: disks,
+							Disks:       disks,
+							Filesystems: filesystems,
 							Interfaces: []vmInterface{{
 								Name:       "default",
 								Masquerade: map[string]any{},

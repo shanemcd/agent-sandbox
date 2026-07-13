@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,17 +37,19 @@ import (
 // Pod sandboxes use a kubelet-projected ServiceAccount token. VMs cannot, so
 // the controller maintains a companion bootstrap Pod (Sandbox-owned, annotated
 // with openshell.io/sandbox-id) and mints a BoundObjectRef TokenRequest into a
-// Secret that is attached as a virtio disk. The guest exchanges that token via
-// IssueSandboxToken the same way Pods do, including rebootstrap after reboot.
+// Secret that is attached as a virtiofs share (ISO Secret disks do not
+// hot-refresh). The guest exchanges that token via IssueSandboxToken the same
+// way Pods do, including rebootstrap after reboot or supervisor restart.
 const (
-	openshellSATokenVolumeName     = "openshell-sa-token"
-	openshellSATokenKey            = "token"
-	openshellSATokenAudience       = "openshell-gateway"
-	openshellSATokenExpAnnotation  = "openshell.io/sa-token-expiration"
-	openshellSandboxIDAnnotation   = "openshell.io/sandbox-id"
-	openshellBootstrapPauseImage   = "registry.k8s.io/pause:3.10"
-	openshellSATokenTTLSeconds     = int64(3600)
-	openshellSATokenRefreshFloor   = time.Minute
+	openshellSATokenVolumeName       = "openshell-sa-token"
+	openshellSATokenKey              = "token"
+	openshellSATokenAudience         = "openshell-gateway"
+	openshellSATokenExpAnnotation    = "openshell.io/sa-token-expiration"
+	openshellSATokenPodUIDAnnotation = "openshell.io/sa-token-bound-pod-uid"
+	openshellSandboxIDAnnotation     = "openshell.io/sandbox-id"
+	openshellBootstrapPauseImage     = "registry.k8s.io/pause:3.10"
+	openshellSATokenTTLSeconds       = int64(3600)
+	openshellSATokenRefreshFloor     = time.Minute
 )
 
 func openshellSATokenSecretName(sandboxName string) string {
@@ -117,7 +120,7 @@ func (r *SandboxReconciler) reconcileOpenshellSABootstrap(ctx context.Context, s
 	secretExists := err == nil
 
 	if secretExists {
-		if requeue, ok := saTokenStillFresh(existing); ok {
+		if requeue, ok := saTokenStillFresh(existing, pod.UID); ok {
 			return requeue, nil
 		}
 	}
@@ -127,15 +130,24 @@ func (r *SandboxReconciler) reconcileOpenshellSABootstrap(ctx context.Context, s
 		return 0, err
 	}
 
-	if err := r.upsertOpenshellSATokenSecret(ctx, sandbox, nameHash, secretName, token, expiration, secretExists, existing); err != nil {
+	if err := r.upsertOpenshellSATokenSecret(ctx, sandbox, nameHash, secretName, token, expiration, string(pod.UID), secretExists, existing); err != nil {
 		return 0, err
 	}
-	logger.Info("Refreshed OpenShell SA token Secret", "Secret.Name", secretName, "expires", expiration)
+	logger.Info("Refreshed OpenShell SA token Secret", "Secret.Name", secretName, "expires", expiration, "boundPodUID", pod.UID)
 
 	return saTokenRequeueAfter(expiration), nil
 }
 
-func saTokenStillFresh(secret *corev1.Secret) (time.Duration, bool) {
+// saTokenStillFresh is true when the Secret is within the refresh window and
+// BoundObjectRef still matches the live bootstrap Pod UID. A Pod recreate
+// invalidates the JWT even if the expiry annotation is still far out.
+func saTokenStillFresh(secret *corev1.Secret, bootstrapUID types.UID) (time.Duration, bool) {
+	if bootstrapUID == "" {
+		return 0, false
+	}
+	if secret.Annotations[openshellSATokenPodUIDAnnotation] != string(bootstrapUID) {
+		return 0, false
+	}
 	raw, ok := secret.Annotations[openshellSATokenExpAnnotation]
 	if !ok || raw == "" {
 		return 0, false
@@ -251,11 +263,13 @@ func (r *SandboxReconciler) upsertOpenshellSATokenSecret(
 	sandbox *sandboxv1beta1.Sandbox,
 	nameHash, secretName, token string,
 	expiration time.Time,
+	boundPodUID string,
 	exists bool,
 	existing *corev1.Secret,
 ) error {
 	annotations := map[string]string{
-		openshellSATokenExpAnnotation: expiration.UTC().Format(time.RFC3339),
+		openshellSATokenExpAnnotation:    expiration.UTC().Format(time.RFC3339),
+		openshellSATokenPodUIDAnnotation: boundPodUID,
 	}
 	data := map[string][]byte{
 		openshellSATokenKey: []byte(token),
@@ -293,6 +307,7 @@ func (r *SandboxReconciler) upsertOpenshellSATokenSecret(
 		existing.Annotations = map[string]string{}
 	}
 	existing.Annotations[openshellSATokenExpAnnotation] = annotations[openshellSATokenExpAnnotation]
+	existing.Annotations[openshellSATokenPodUIDAnnotation] = annotations[openshellSATokenPodUIDAnnotation]
 	existing.Data = data
 	existing.StringData = nil
 	if err := r.Patch(ctx, existing, patch, client.FieldOwner(sandboxControllerFieldOwner)); err != nil {

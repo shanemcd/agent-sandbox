@@ -17,12 +17,14 @@ package controllers
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 
 	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 )
@@ -188,6 +190,60 @@ func TestAppendVMSecretDisks(t *testing.T) {
 	assert.Equal(t, int32(0o400), *volumes[1].Secret.DefaultMode)
 }
 
+func TestAppendVMSecretFilesystemsSkipsISOForSAToken(t *testing.T) {
+	mode := int32(0o400)
+	disks := []vmDisk{virtioDisk("containerdisk", "")}
+	volumes := []vmVolume{{Name: "containerdisk"}}
+	mounts := []vmSecretMount{
+		{
+			Name: openshellSATokenVolumeName, MountPath: "/var/run/secrets/openshell",
+			SecretName: "hermes-openshell-sa-token", Serial: "openshellsatoken", DefaultMode: &mode,
+		},
+		{
+			Name: "openshell-client-tls", MountPath: "/etc/openshell-tls/client",
+			SecretName: "openshell-client-tls", Serial: "openshellclienttls", DefaultMode: &mode,
+		},
+	}
+
+	disks, volumes = appendVMSecretDisks(disks, volumes, mounts)
+	require.Len(t, disks, 2, "SA token must not be an ISO disk")
+	require.Len(t, volumes, 2)
+	assert.Equal(t, "openshell-client-tls", volumes[1].Name)
+
+	var filesystems []vmFilesystem
+	filesystems, volumes = appendVMSecretFilesystems(filesystems, volumes, mounts)
+	require.Len(t, filesystems, 1)
+	assert.Equal(t, openshellSATokenVolumeName, filesystems[0].Name)
+	require.NotNil(t, filesystems[0].Virtiofs)
+	require.Len(t, volumes, 3)
+	assert.Equal(t, openshellSATokenVolumeName, volumes[2].Name)
+	require.NotNil(t, volumes[2].Secret)
+	assert.Equal(t, "hermes-openshell-sa-token", volumes[2].Secret.SecretName)
+}
+
+func TestSaTokenStillFreshRequiresMatchingPodUID(t *testing.T) {
+	uid := types.UID("live-bootstrap-uid")
+	exp := time.Now().Add(50 * time.Minute).UTC().Format(time.RFC3339)
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				openshellSATokenExpAnnotation:    exp,
+				openshellSATokenPodUIDAnnotation: string(uid),
+			},
+		},
+	}
+	requeue, ok := saTokenStillFresh(secret, uid)
+	assert.True(t, ok)
+	assert.Greater(t, requeue, time.Duration(0))
+
+	_, ok = saTokenStillFresh(secret, types.UID("other-uid"))
+	assert.False(t, ok)
+
+	secret.Annotations[openshellSATokenPodUIDAnnotation] = ""
+	_, ok = saTokenStillFresh(secret, uid)
+	assert.False(t, ok)
+}
+
 func TestBuildVirtualMachineObject(t *testing.T) {
 	mode := int32(0o400)
 	sandbox := &sandboxv1beta1.Sandbox{
@@ -202,17 +258,29 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 							VolumeMounts: []corev1.VolumeMount{
 								{Name: "sandbox-data", MountPath: "/sandbox"},
 								{Name: "openshell-client-tls", MountPath: "/etc/openshell-tls/client"},
+								{Name: openshellSATokenVolumeName, MountPath: "/var/run/secrets/openshell"},
 							},
 						}},
-						Volumes: []corev1.Volume{{
-							Name: "openshell-client-tls",
-							VolumeSource: corev1.VolumeSource{
-								Secret: &corev1.SecretVolumeSource{
-									SecretName:  "openshell-client-tls",
-									DefaultMode: &mode,
+						Volumes: []corev1.Volume{
+							{
+								Name: "openshell-client-tls",
+								VolumeSource: corev1.VolumeSource{
+									Secret: &corev1.SecretVolumeSource{
+										SecretName:  "openshell-client-tls",
+										DefaultMode: &mode,
+									},
 								},
 							},
-						}},
+							{
+								Name: openshellSATokenVolumeName,
+								VolumeSource: corev1.VolumeSource{
+									Secret: &corev1.SecretVolumeSource{
+										SecretName:  "hermes-openshell-sa-token",
+										DefaultMode: &mode,
+									},
+								},
+							},
+						},
 					},
 				},
 				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{
@@ -231,7 +299,7 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 	vols, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "volumes")
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Len(t, vols, 4)
+	require.Len(t, vols, 5)
 
 	containerDisk := vols[0].(map[string]interface{})
 	assert.Equal(t, "hermes:latest", containerDisk["containerDisk"].(map[string]interface{})["image"])
@@ -249,10 +317,15 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 	assert.Equal(t, "openshell-client-tls",
 		secretVol["secret"].(map[string]interface{})["secretName"])
 
+	saVol := vols[4].(map[string]interface{})
+	assert.Equal(t, openshellSATokenVolumeName, saVol["name"])
+	assert.Equal(t, "hermes-openshell-sa-token",
+		saVol["secret"].(map[string]interface{})["secretName"])
+
 	disks, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "domain", "devices", "disks")
 	require.NoError(t, err)
 	require.True(t, found)
-	require.Len(t, disks, 4)
+	require.Len(t, disks, 4, "SA token must be virtiofs, not a disk")
 
 	metaDisk := disks[1].(map[string]interface{})
 	assert.Equal(t, sandboxMetaSerial, metaDisk["serial"])
@@ -263,4 +336,13 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 
 	secretDisk := disks[3].(map[string]interface{})
 	assert.Equal(t, "openshellclienttls", secretDisk["serial"])
+
+	filesystems, found, err := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "domain", "devices", "filesystems")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Len(t, filesystems, 1)
+	fs := filesystems[0].(map[string]interface{})
+	assert.Equal(t, openshellSATokenVolumeName, fs["name"])
+	_, hasVirtiofs := fs["virtiofs"]
+	assert.True(t, hasVirtiofs)
 }
