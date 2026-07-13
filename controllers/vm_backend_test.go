@@ -346,3 +346,89 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 	_, hasVirtiofs := fs["virtiofs"]
 	assert.True(t, hasVirtiofs)
 }
+
+func TestVMContainerDiskImageHelpers(t *testing.T) {
+	vm := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "kubevirt.io/v1",
+		"kind":       "VirtualMachine",
+		"metadata": map[string]interface{}{
+			"name":      "hermes",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"volumes": []interface{}{
+						map[string]interface{}{
+							"name": "containerdisk",
+							"containerDisk": map[string]interface{}{
+								"image": "old:image",
+							},
+						},
+						map[string]interface{}{
+							"name": "workspace",
+							"persistentVolumeClaim": map[string]interface{}{
+								"claimName": "workspace-hermes",
+							},
+						},
+					},
+				},
+			},
+		},
+	}}
+
+	got, err := vmContainerDiskImage(vm)
+	require.NoError(t, err)
+	assert.Equal(t, "old:image", got)
+
+	// No-op path: set to same value
+	require.NoError(t, setVMContainerDiskImage(vm, "old:image"))
+	got, err = vmContainerDiskImage(vm)
+	require.NoError(t, err)
+	assert.Equal(t, "old:image", got)
+
+	// Update
+	require.NoError(t, setVMContainerDiskImage(vm, "new:image@sha256:abc"))
+	got, err = vmContainerDiskImage(vm)
+	require.NoError(t, err)
+	assert.Equal(t, "new:image@sha256:abc", got)
+
+	// Other volumes preserved
+	vols, found, err := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Len(t, vols, 2)
+	assert.Equal(t, "workspace", vols[1].(map[string]interface{})["name"])
+}
+
+func TestVMContainerDiskImageMissingVolume(t *testing.T) {
+	vm := &unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{"name": "hermes", "namespace": "default"},
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"volumes": []interface{}{
+						map[string]interface{}{"name": "workspace"},
+					},
+				},
+			},
+		},
+	}}
+	_, err := vmContainerDiskImage(vm)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing volume named containerdisk")
+
+	err = setVMContainerDiskImage(vm, "new:image")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing volume named containerdisk")
+}
+
+func TestVMContainerDiskImageNoVolumes(t *testing.T) {
+	vm := &unstructured.Unstructured{Object: map[string]interface{}{
+		"metadata": map[string]interface{}{"name": "hermes", "namespace": "default"},
+		"spec":     map[string]interface{}{},
+	}}
+	_, err := vmContainerDiskImage(vm)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has no volumes")
+}

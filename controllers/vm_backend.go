@@ -326,6 +326,13 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 		return result, nil
 	}
 
+	// Keep containerDisk.image aligned with the Sandbox podTemplate image.
+	// Does not restart the VMI — operators reboot/restart when ready so PVC
+	// data at /sandbox is preserved across in-place guest OS upgrades.
+	if _, err := r.syncVMContainerDiskImage(ctx, sandbox, vm); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
 	if !running {
 		logger.Info("Resuming VirtualMachine", "VM.Name", vmName)
@@ -337,6 +344,101 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 	}
 
 	return result, r.updateStatusFromVMI(ctx, sandbox, vmName)
+}
+
+// syncVMContainerDiskImage patches the existing VM when the Sandbox container
+// image differs from volumes[name=containerdisk].containerDisk.image.
+// Returns true when a patch was applied. Does not restart the VMI.
+func (r *SandboxReconciler) syncVMContainerDiskImage(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vm *unstructured.Unstructured) (bool, error) {
+	logger := log.FromContext(ctx)
+	desired := vmContainerImage(sandbox)
+	current, err := vmContainerDiskImage(vm)
+	if err != nil {
+		return false, err
+	}
+	if current == desired {
+		return false, nil
+	}
+
+	patch := client.MergeFrom(vm.DeepCopy())
+	if err := setVMContainerDiskImage(vm, desired); err != nil {
+		return false, err
+	}
+	if err := r.Patch(ctx, vm, patch); err != nil {
+		return false, fmt.Errorf("failed to patch VirtualMachine containerDisk image: %w", err)
+	}
+	logger.Info("Updated VirtualMachine containerDisk image",
+		"VM.Name", vm.GetName(), "from", current, "to", desired)
+	return true, nil
+}
+
+// vmContainerDiskImage returns the containerDisk.image for the volume named
+// "containerdisk", or an error if that volume is missing.
+func vmContainerDiskImage(vm *unstructured.Unstructured) (string, error) {
+	volumes, found, err := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if err != nil {
+		return "", fmt.Errorf("read VirtualMachine volumes: %w", err)
+	}
+	if !found {
+		return "", fmt.Errorf("VirtualMachine %s/%s has no volumes", vm.GetNamespace(), vm.GetName())
+	}
+	for _, raw := range volumes {
+		vol, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(vol, "name")
+		if name != "containerdisk" {
+			continue
+		}
+		image, imgFound, imgErr := unstructured.NestedString(vol, "containerDisk", "image")
+		if imgErr != nil {
+			return "", fmt.Errorf("read containerDisk.image: %w", imgErr)
+		}
+		if !imgFound || image == "" {
+			return "", fmt.Errorf("VirtualMachine %s/%s volume containerdisk missing containerDisk.image",
+				vm.GetNamespace(), vm.GetName())
+		}
+		return image, nil
+	}
+	return "", fmt.Errorf("VirtualMachine %s/%s missing volume named containerdisk",
+		vm.GetNamespace(), vm.GetName())
+}
+
+// setVMContainerDiskImage sets volumes[name=containerdisk].containerDisk.image.
+func setVMContainerDiskImage(vm *unstructured.Unstructured, image string) error {
+	volumes, found, err := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if err != nil {
+		return fmt.Errorf("read VirtualMachine volumes: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("VirtualMachine %s/%s has no volumes", vm.GetNamespace(), vm.GetName())
+	}
+	updated := false
+	for i, raw := range volumes {
+		vol, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(vol, "name")
+		if name != "containerdisk" {
+			continue
+		}
+		if err := unstructured.SetNestedField(vol, image, "containerDisk", "image"); err != nil {
+			return fmt.Errorf("set containerDisk.image: %w", err)
+		}
+		volumes[i] = vol
+		updated = true
+		break
+	}
+	if !updated {
+		return fmt.Errorf("VirtualMachine %s/%s missing volume named containerdisk",
+			vm.GetNamespace(), vm.GetName())
+	}
+	if err := unstructured.SetNestedSlice(vm.Object, volumes, "spec", "template", "spec", "volumes"); err != nil {
+		return fmt.Errorf("write VirtualMachine volumes: %w", err)
+	}
+	return nil
 }
 
 func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName, nameHash string, pvcMounts []vmVolumeMount, secretMounts []vmSecretMount) error {
