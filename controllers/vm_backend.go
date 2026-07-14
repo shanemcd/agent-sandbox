@@ -82,34 +82,57 @@ func virtioDiskSerial(name string) string {
 	return s
 }
 
-// collectVMVolumeMounts returns mounts from the first container that reference
-// a volumeClaimTemplate. Unreferenced claim templates are omitted (PVC is still
-// created by reconcilePVCs, but not attached to the VM).
+// collectVMVolumeMounts returns mounts from the first container that should be
+// attached as KubeVirt virtio disks backed by PVCs.
+//
+// Resolution order per volumeMount name:
+//  1. Explicit podTemplate.spec.volumes[].persistentVolumeClaim.claimName
+//     (named PVC passthrough — preferred when both this and a VCT exist)
+//  2. Else a matching volumeClaimTemplate → claim name <template>-<sandbox>
+//
+// Unreferenced claim templates are omitted (PVC may still be created by
+// reconcilePVCs, but is not attached to the VM). Explicit passthrough claims
+// are never created or ownerRef'd by reconcilePVCs.
 func collectVMVolumeMounts(sandbox *sandboxv1beta1.Sandbox) []vmVolumeMount {
-	claimNames := make(map[string]struct{}, len(sandbox.Spec.VolumeClaimTemplates))
-	for _, t := range sandbox.Spec.VolumeClaimTemplates {
-		claimNames[t.Name] = struct{}{}
-	}
-	if len(claimNames) == 0 {
-		return nil
-	}
 	if len(sandbox.Spec.PodTemplate.Spec.Containers) == 0 {
 		return nil
 	}
+
+	pvcByVolName := make(map[string]string)
+	for _, v := range sandbox.Spec.PodTemplate.Spec.Volumes {
+		if v.PersistentVolumeClaim == nil || v.PersistentVolumeClaim.ClaimName == "" {
+			continue
+		}
+		pvcByVolName[v.Name] = v.PersistentVolumeClaim.ClaimName
+	}
+
+	vctNames := make(map[string]struct{}, len(sandbox.Spec.VolumeClaimTemplates))
+	for _, t := range sandbox.Spec.VolumeClaimTemplates {
+		vctNames[t.Name] = struct{}{}
+	}
+	if len(pvcByVolName) == 0 && len(vctNames) == 0 {
+		return nil
+	}
+
 	var out []vmVolumeMount
 	seen := make(map[string]struct{})
 	for _, m := range sandbox.Spec.PodTemplate.Spec.Containers[0].VolumeMounts {
-		if _, ok := claimNames[m.Name]; !ok {
+		if _, dup := seen[m.Name]; dup {
 			continue
 		}
-		if _, dup := seen[m.Name]; dup {
+		var claimName string
+		if cn, ok := pvcByVolName[m.Name]; ok {
+			claimName = cn
+		} else if _, ok := vctNames[m.Name]; ok {
+			claimName = pvcClaimName(m.Name, sandbox.Name)
+		} else {
 			continue
 		}
 		seen[m.Name] = struct{}{}
 		out = append(out, vmVolumeMount{
 			Name:      m.Name,
 			MountPath: m.MountPath,
-			ClaimName: pvcClaimName(m.Name, sandbox.Name),
+			ClaimName: claimName,
 			Serial:    virtioDiskSerial(m.Name),
 		})
 	}
@@ -336,6 +359,11 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 	if _, err := r.syncVMContainerDiskImage(ctx, sandbox, vm); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Keep PVC claimNames aligned with collectVMVolumeMounts (VCT or named
+	// passthrough). Does not restart the VMI — operators restart after cutover.
+	if _, err := r.syncVMPersistentVolumeClaims(ctx, sandbox, vm); err != nil {
+		return ctrl.Result{}, err
+	}
 	if _, err := r.syncVMResources(ctx, sandbox, vm); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -376,6 +404,33 @@ func (r *SandboxReconciler) syncVMContainerDiskImage(ctx context.Context, sandbo
 	}
 	logger.Info("Updated VirtualMachine containerDisk image",
 		"VM.Name", vm.GetName(), "from", current, "to", desired)
+	return true, nil
+}
+
+// syncVMPersistentVolumeClaims patches the existing VM when a desired workspace
+// (or other claim) claimName from collectVMVolumeMounts differs from the VM
+// volume's persistentVolumeClaim.claimName. Returns true when a patch was
+// applied. Does not restart the VMI. Missing VM volumes are skipped (create
+// path attaches them; this only updates claimName on existing volumes).
+func (r *SandboxReconciler) syncVMPersistentVolumeClaims(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vm *unstructured.Unstructured) (bool, error) {
+	logger := log.FromContext(ctx)
+	desired := collectVMVolumeMounts(sandbox)
+	if len(desired) == 0 {
+		return false, nil
+	}
+
+	patch := client.MergeFrom(vm.DeepCopy())
+	changed, err := setVMPVCClaimNames(vm, desired)
+	if err != nil {
+		return false, err
+	}
+	if !changed {
+		return false, nil
+	}
+	if err := r.Patch(ctx, vm, patch); err != nil {
+		return false, fmt.Errorf("failed to patch VirtualMachine PVC claimNames: %w", err)
+	}
+	logger.Info("Updated VirtualMachine persistentVolumeClaim claimNames", "VM.Name", vm.GetName())
 	return true, nil
 }
 
@@ -526,6 +581,79 @@ func vmContainerDiskImage(vm *unstructured.Unstructured) (string, error) {
 	}
 	return "", fmt.Errorf("VirtualMachine %s/%s missing volume named containerdisk",
 		vm.GetNamespace(), vm.GetName())
+}
+
+// vmPVCClaimName returns persistentVolumeClaim.claimName for the named volume,
+// or ("", false, nil) when the volume is missing or has no PVC source.
+func vmPVCClaimName(vm *unstructured.Unstructured, volumeName string) (string, bool, error) {
+	volumes, found, err := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if err != nil {
+		return "", false, fmt.Errorf("read VirtualMachine volumes: %w", err)
+	}
+	if !found {
+		return "", false, nil
+	}
+	for _, raw := range volumes {
+		vol, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, _, _ := unstructured.NestedString(vol, "name")
+		if name != volumeName {
+			continue
+		}
+		claim, claimFound, claimErr := unstructured.NestedString(vol, "persistentVolumeClaim", "claimName")
+		if claimErr != nil {
+			return "", false, fmt.Errorf("read persistentVolumeClaim.claimName: %w", claimErr)
+		}
+		if !claimFound || claim == "" {
+			return "", false, nil
+		}
+		return claim, true, nil
+	}
+	return "", false, nil
+}
+
+// setVMPVCClaimNames updates persistentVolumeClaim.claimName for each mount
+// whose volume already exists on the VM. Returns true when any claimName changed.
+func setVMPVCClaimNames(vm *unstructured.Unstructured, mounts []vmVolumeMount) (bool, error) {
+	volumes, found, err := unstructured.NestedSlice(vm.Object, "spec", "template", "spec", "volumes")
+	if err != nil {
+		return false, fmt.Errorf("read VirtualMachine volumes: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+	changed := false
+	for _, mount := range mounts {
+		for i, raw := range volumes {
+			vol, ok := raw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _, _ := unstructured.NestedString(vol, "name")
+			if name != mount.Name {
+				continue
+			}
+			current, _, _ := unstructured.NestedString(vol, "persistentVolumeClaim", "claimName")
+			if current == mount.ClaimName {
+				break
+			}
+			if err := unstructured.SetNestedField(vol, mount.ClaimName, "persistentVolumeClaim", "claimName"); err != nil {
+				return false, fmt.Errorf("set persistentVolumeClaim.claimName: %w", err)
+			}
+			volumes[i] = vol
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	if err := unstructured.SetNestedSlice(vm.Object, volumes, "spec", "template", "spec", "volumes"); err != nil {
+		return false, fmt.Errorf("write VirtualMachine volumes: %w", err)
+	}
+	return true, nil
 }
 
 // setVMContainerDiskImage sets volumes[name=containerdisk].containerDisk.image.

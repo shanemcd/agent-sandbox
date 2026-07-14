@@ -148,6 +148,138 @@ func TestCollectVMVolumeMounts(t *testing.T) {
 	assert.Equal(t, "sandboxdata", mounts[0].Serial)
 }
 
+func TestCollectVMVolumeMountsExplicitPVC(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name: "sandbox",
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "workspace", MountPath: "/sandbox"},
+							},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "workspace",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "workspace-hermes-20gi",
+								},
+							},
+						}},
+					},
+				},
+			},
+		},
+	}
+
+	mounts := collectVMVolumeMounts(sandbox)
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "workspace", mounts[0].Name)
+	assert.Equal(t, "/sandbox", mounts[0].MountPath)
+	assert.Equal(t, "workspace-hermes-20gi", mounts[0].ClaimName)
+	assert.Equal(t, "workspace", mounts[0].Serial)
+}
+
+func TestCollectVMVolumeMountsExplicitPVCPrefersOverVCT(t *testing.T) {
+	sandbox := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "hermes"},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{
+							Name: "sandbox",
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "workspace", MountPath: "/sandbox"},
+							},
+						}},
+						Volumes: []corev1.Volume{{
+							Name: "workspace",
+							VolumeSource: corev1.VolumeSource{
+								PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+									ClaimName: "workspace-hermes-20gi",
+								},
+							},
+						}},
+					},
+				},
+				VolumeClaimTemplates: []sandboxv1beta1.PersistentVolumeClaimTemplate{
+					{EmbeddedObjectMetadata: sandboxv1beta1.EmbeddedObjectMetadata{Name: "workspace"}},
+				},
+			},
+		},
+	}
+
+	mounts := collectVMVolumeMounts(sandbox)
+	require.Len(t, mounts, 1)
+	assert.Equal(t, "workspace-hermes-20gi", mounts[0].ClaimName,
+		"explicit podTemplate PVC claimName must win over VCT-derived workspace-hermes")
+}
+
+func TestSetVMPVCClaimNames(t *testing.T) {
+	vm := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "kubevirt.io/v1",
+		"kind":       "VirtualMachine",
+		"metadata": map[string]interface{}{
+			"name":      "hermes",
+			"namespace": "default",
+		},
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"volumes": []interface{}{
+						map[string]interface{}{
+							"name": "containerdisk",
+							"containerDisk": map[string]interface{}{
+								"image": "img:latest",
+							},
+						},
+						map[string]interface{}{
+							"name": "workspace",
+							"persistentVolumeClaim": map[string]interface{}{
+								"claimName": "workspace-hermes",
+							},
+						},
+					},
+				},
+			},
+		},
+	}}
+
+	claim, found, err := vmPVCClaimName(vm, "workspace")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "workspace-hermes", claim)
+
+	// No-op when claim already matches
+	changed, err := setVMPVCClaimNames(vm, []vmVolumeMount{{
+		Name: "workspace", ClaimName: "workspace-hermes",
+	}})
+	require.NoError(t, err)
+	assert.False(t, changed)
+
+	changed, err = setVMPVCClaimNames(vm, []vmVolumeMount{{
+		Name: "workspace", ClaimName: "workspace-hermes-20gi",
+	}})
+	require.NoError(t, err)
+	assert.True(t, changed)
+
+	claim, found, err = vmPVCClaimName(vm, "workspace")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "workspace-hermes-20gi", claim)
+
+	// Missing volume is skipped (no error, no change)
+	changed, err = setVMPVCClaimNames(vm, []vmVolumeMount{{
+		Name: "missing", ClaimName: "other",
+	}})
+	require.NoError(t, err)
+	assert.False(t, changed)
+}
+
 func TestAppendVMClaimDisks(t *testing.T) {
 	disks := []vmDisk{virtioDisk("containerdisk", "")}
 	volumes := []vmVolume{{Name: "containerdisk"}}

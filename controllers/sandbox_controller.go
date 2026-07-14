@@ -1411,6 +1411,8 @@ func (r *SandboxReconciler) reconcilePVCs(ctx context.Context, sandbox *sandboxv
 	ctx, end := r.Tracer.StartSpan(ctx, nil, "reconcilePVCs", nil)
 	defer end()
 
+	// Only volumeClaimTemplates are created/adopted here. Named PVC passthrough
+	// (podTemplate.spec.volumes[].persistentVolumeClaim) is never ownerRef'd.
 	for _, pvcTemplate := range sandbox.Spec.VolumeClaimTemplates {
 		pvc := &corev1.PersistentVolumeClaim{}
 		pvcName := pvcClaimName(pvcTemplate.Name, sandbox.Name)
