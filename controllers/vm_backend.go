@@ -20,8 +20,10 @@ import (
 	"hash/fnv"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -176,10 +178,11 @@ type vmFilesystem struct {
 
 type vmDomainResources struct {
 	Requests map[string]string `json:"requests"`
+	Limits   map[string]string `json:"limits,omitempty"`
 }
 
 type vmDomain struct {
-	CPU       vmDomainCPU       `json:"cpu"`
+	CPU       *vmDomainCPU      `json:"cpu,omitempty"`
 	Devices   vmDomainDevices   `json:"devices"`
 	Resources vmDomainResources `json:"resources"`
 }
@@ -314,10 +317,11 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 
 		pvcMounts := collectVMVolumeMounts(sandbox)
 		secretMounts := collectVMSecretMounts(sandbox)
-		if err := r.createSandboxMetaSecret(ctx, sandbox, nameHash, pvcMounts, secretMounts); err != nil {
+		cfg := newVMConfig(sandbox, nameHash, pvcMounts, secretMounts)
+		if err := r.createSandboxMetaSecret(ctx, sandbox, nameHash, cfg.PVCMounts, cfg.SecretMounts); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.createVirtualMachine(ctx, sandbox, vmName, nameHash, pvcMounts, secretMounts); err != nil {
+		if err := r.createVirtualMachine(ctx, sandbox, vmName, cfg); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -441,10 +445,10 @@ func setVMContainerDiskImage(vm *unstructured.Unstructured, image string) error 
 	return nil
 }
 
-func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName, nameHash string, pvcMounts []vmVolumeMount, secretMounts []vmSecretMount) error {
+func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vmName string, cfg vmConfig) error {
 	logger := log.FromContext(ctx)
 
-	vm, err := buildVirtualMachineObject(sandbox, vmName, nameHash, pvcMounts, secretMounts)
+	vm, err := buildVirtualMachineObject(sandbox, vmName, cfg)
 	if err != nil {
 		return err
 	}
@@ -458,7 +462,7 @@ func (r *SandboxReconciler) createVirtualMachine(ctx context.Context, sandbox *s
 		}
 		return fmt.Errorf("failed to create VirtualMachine: %w", err)
 	}
-	logger.Info("Created VirtualMachine", "VM.Name", vmName, "Image", vmContainerImage(sandbox))
+	logger.Info("Created VirtualMachine", "VM.Name", vmName, "Image", cfg.Image)
 	return nil
 }
 
@@ -480,12 +484,87 @@ func vmLabels(sandbox *sandboxv1beta1.Sandbox, nameHash string) map[string]strin
 	return labels
 }
 
+const (
+	defaultVMCPUCores = int64(2)
+	defaultVMMemory   = "2048Mi"
+)
+
+// vmResourceConfig holds the CPU and memory settings for a KubeVirt VM domain,
+// derived from the Sandbox CR's container resource requirements.
+type vmResourceConfig struct {
+	CPUCores int64             // set when CPU is a whole number; 0 means use Requests["cpu"]
+	Requests map[string]string // always has "memory"; has "cpu" only when fractional
+	Limits   map[string]string // nil when no limits are set
+}
+
+// vmConfig collects every Sandbox-derived setting needed to build a KubeVirt
+// VirtualMachine. New CR-to-VM mappings add a field here and a corresponding
+// extractor function.
+type vmConfig struct {
+	Image        string
+	Labels       map[string]string
+	PVCMounts    []vmVolumeMount
+	SecretMounts []vmSecretMount
+	Resources    vmResourceConfig
+}
+
+func newVMConfig(sandbox *sandboxv1beta1.Sandbox, nameHash string, pvcMounts []vmVolumeMount, secretMounts []vmSecretMount) vmConfig {
+	return vmConfig{
+		Image:        vmContainerImage(sandbox),
+		Labels:       vmLabels(sandbox, nameHash),
+		PVCMounts:    pvcMounts,
+		SecretMounts: secretMounts,
+		Resources:    vmContainerResources(sandbox),
+	}
+}
+
+// isWholeNumber returns true when q represents an integer value (e.g. "2", "4")
+// rather than a fractional one (e.g. "500m", "1.5").
+func isWholeNumber(q resource.Quantity) bool {
+	return q.MilliValue()%1000 == 0
+}
+
+func vmContainerResources(sandbox *sandboxv1beta1.Sandbox) vmResourceConfig {
+	res := vmResourceConfig{
+		CPUCores: defaultVMCPUCores,
+		Requests: map[string]string{"memory": defaultVMMemory},
+	}
+	if len(sandbox.Spec.PodTemplate.Spec.Containers) == 0 {
+		return res
+	}
+	c := sandbox.Spec.PodTemplate.Spec.Containers[0]
+
+	if cpu, ok := c.Resources.Requests[corev1.ResourceCPU]; ok && !cpu.IsZero() {
+		if isWholeNumber(cpu) {
+			res.CPUCores = cpu.Value()
+		} else {
+			res.CPUCores = 0
+			res.Requests["cpu"] = cpu.String()
+		}
+	}
+	if mem, ok := c.Resources.Requests[corev1.ResourceMemory]; ok && !mem.IsZero() {
+		res.Requests["memory"] = mem.String()
+	}
+
+	if cpuLim, ok := c.Resources.Limits[corev1.ResourceCPU]; ok && !cpuLim.IsZero() {
+		if res.Limits == nil {
+			res.Limits = map[string]string{}
+		}
+		res.Limits["cpu"] = cpuLim.String()
+	}
+	if memLim, ok := c.Resources.Limits[corev1.ResourceMemory]; ok && !memLim.IsZero() {
+		if res.Limits == nil {
+			res.Limits = map[string]string{}
+		}
+		res.Limits["memory"] = memLim.String()
+	}
+
+	return res
+}
+
 // buildVirtualMachineObject constructs the VirtualMachine for create using typed
 // local structs, then converts once to unstructured for the dynamic client.
-func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName, nameHash string, pvcMounts []vmVolumeMount, secretMounts []vmSecretMount) (*unstructured.Unstructured, error) {
-	image := vmContainerImage(sandbox)
-	labels := vmLabels(sandbox, nameHash)
-
+func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName string, cfg vmConfig) (*unstructured.Unstructured, error) {
 	disks := []vmDisk{
 		virtioDisk("containerdisk", ""),
 		virtioDisk(sandboxMetaVolumeName, sandboxMetaSerial),
@@ -493,14 +572,32 @@ func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName, nameHash
 	volumes := []vmVolume{
 		{
 			Name:          "containerdisk",
-			ContainerDisk: &vmContainerDisk{Image: image},
+			ContainerDisk: &vmContainerDisk{Image: cfg.Image},
 		},
 		secretVolume(sandboxMetaVolumeName, sandboxMetaSecretName(sandbox.Name), nil),
 	}
-	disks, volumes = appendVMClaimDisks(disks, volumes, pvcMounts)
-	disks, volumes = appendVMSecretDisks(disks, volumes, secretMounts)
+	disks, volumes = appendVMClaimDisks(disks, volumes, cfg.PVCMounts)
+	disks, volumes = appendVMSecretDisks(disks, volumes, cfg.SecretMounts)
 	var filesystems []vmFilesystem
-	filesystems, volumes = appendVMSecretFilesystems(filesystems, volumes, secretMounts)
+	filesystems, volumes = appendVMSecretFilesystems(filesystems, volumes, cfg.SecretMounts)
+
+	domain := vmDomain{
+		Devices: vmDomainDevices{
+			Disks:       disks,
+			Filesystems: filesystems,
+			Interfaces: []vmInterface{{
+				Name:       "default",
+				Masquerade: map[string]any{},
+			}},
+		},
+		Resources: vmDomainResources{
+			Requests: cfg.Resources.Requests,
+			Limits:   cfg.Resources.Limits,
+		},
+	}
+	if cfg.Resources.CPUCores > 0 {
+		domain.CPU = &vmDomainCPU{Cores: cfg.Resources.CPUCores}
+	}
 
 	typed := kubevirtVirtualMachine{
 		APIVersion: kubevirtVMGVK.GroupVersion().String(),
@@ -508,27 +605,14 @@ func buildVirtualMachineObject(sandbox *sandboxv1beta1.Sandbox, vmName, nameHash
 		Metadata: metav1.ObjectMeta{
 			Name:      vmName,
 			Namespace: sandbox.Namespace,
-			Labels:    labels,
+			Labels:    cfg.Labels,
 		},
 		Spec: vmSpec{
 			Running: true,
 			Template: vmTemplate{
-				Metadata: metav1.ObjectMeta{Labels: labels},
+				Metadata: metav1.ObjectMeta{Labels: cfg.Labels},
 				Spec: vmTemplateSpec{
-					Domain: vmDomain{
-						CPU: vmDomainCPU{Cores: 2},
-						Devices: vmDomainDevices{
-							Disks:       disks,
-							Filesystems: filesystems,
-							Interfaces: []vmInterface{{
-								Name:       "default",
-								Masquerade: map[string]any{},
-							}},
-						},
-						Resources: vmDomainResources{
-							Requests: map[string]string{"memory": "2048Mi"},
-						},
-					},
+					Domain: domain,
 					Networks: []vmNetwork{{
 						Name: "default",
 						Pod:  map[string]any{},

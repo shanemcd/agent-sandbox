@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -292,7 +293,8 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 
 	pvcMounts := collectVMVolumeMounts(sandbox)
 	secretMounts := collectVMSecretMounts(sandbox)
-	u, err := buildVirtualMachineObject(sandbox, "hermes", "hash", pvcMounts, secretMounts)
+	cfg := newVMConfig(sandbox, "hash", pvcMounts, secretMounts)
+	u, err := buildVirtualMachineObject(sandbox, "hermes", cfg)
 	require.NoError(t, err)
 	assert.Equal(t, kubevirtVMGVK, u.GroupVersionKind())
 
@@ -345,6 +347,129 @@ func TestBuildVirtualMachineObject(t *testing.T) {
 	assert.Equal(t, openshellSATokenVolumeName, fs["name"])
 	_, hasVirtiofs := fs["virtiofs"]
 	assert.True(t, hasVirtiofs)
+
+	// Default resources: 2 CPU cores, 2048Mi memory, no limits.
+	cpuCores, found, err := unstructured.NestedInt64(u.Object, "spec", "template", "spec", "domain", "cpu", "cores")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, int64(2), cpuCores)
+
+	mem, found, err := unstructured.NestedString(u.Object, "spec", "template", "spec", "domain", "resources", "requests", "memory")
+	require.NoError(t, err)
+	require.True(t, found)
+	assert.Equal(t, "2048Mi", mem)
+
+	_, found, _ = unstructured.NestedMap(u.Object, "spec", "template", "spec", "domain", "resources", "limits")
+	assert.False(t, found, "no limits when CR omits them")
+}
+
+func TestVMContainerResources(t *testing.T) {
+	tests := []struct {
+		name         string
+		resources    corev1.ResourceRequirements
+		wantCores    int64
+		wantRequests map[string]string
+		wantLimits   map[string]string
+	}{
+		{
+			name:         "defaults when no resources set",
+			wantCores:    2,
+			wantRequests: map[string]string{"memory": "2048Mi"},
+		},
+		{
+			name: "integer CPU request sets cores",
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("4"),
+				},
+			},
+			wantCores:    4,
+			wantRequests: map[string]string{"memory": "2048Mi"},
+		},
+		{
+			name: "fractional CPU request uses resource string",
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU: resource.MustParse("500m"),
+				},
+			},
+			wantCores:    0,
+			wantRequests: map[string]string{"memory": "2048Mi", "cpu": "500m"},
+		},
+		{
+			name: "memory override",
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceMemory: resource.MustParse("4Gi"),
+				},
+			},
+			wantCores:    2,
+			wantRequests: map[string]string{"memory": "4Gi"},
+		},
+		{
+			name: "both requests and limits",
+			resources: corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("2"),
+					corev1.ResourceMemory: resource.MustParse("4Gi"),
+				},
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("4"),
+					corev1.ResourceMemory: resource.MustParse("8Gi"),
+				},
+			},
+			wantCores:    2,
+			wantRequests: map[string]string{"memory": "4Gi"},
+			wantLimits:   map[string]string{"cpu": "4", "memory": "8Gi"},
+		},
+		{
+			name: "limits only",
+			resources: corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("8"),
+					corev1.ResourceMemory: resource.MustParse("16Gi"),
+				},
+			},
+			wantCores:    2,
+			wantRequests: map[string]string{"memory": "2048Mi"},
+			wantLimits:   map[string]string{"cpu": "8", "memory": "16Gi"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sandbox := &sandboxv1beta1.Sandbox{
+				Spec: sandboxv1beta1.SandboxSpec{
+					SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+						PodTemplate: sandboxv1beta1.PodTemplate{
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{
+									Name:      "sandbox",
+									Resources: tt.resources,
+								}},
+							},
+						},
+					},
+				},
+			}
+			res := vmContainerResources(sandbox)
+			assert.Equal(t, tt.wantCores, res.CPUCores)
+			assert.Equal(t, tt.wantRequests, res.Requests)
+			if tt.wantLimits == nil {
+				assert.Nil(t, res.Limits)
+			} else {
+				assert.Equal(t, tt.wantLimits, res.Limits)
+			}
+		})
+	}
+
+	t.Run("no containers defaults", func(t *testing.T) {
+		sandbox := &sandboxv1beta1.Sandbox{}
+		res := vmContainerResources(sandbox)
+		assert.Equal(t, int64(2), res.CPUCores)
+		assert.Equal(t, map[string]string{"memory": "2048Mi"}, res.Requests)
+		assert.Nil(t, res.Limits)
+	})
 }
 
 func TestVMContainerDiskImageHelpers(t *testing.T) {
