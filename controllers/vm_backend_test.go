@@ -472,6 +472,149 @@ func TestVMContainerResources(t *testing.T) {
 	})
 }
 
+func buildTestVM(cores int64, requests, limits map[string]string) *unstructured.Unstructured {
+	domain := map[string]interface{}{
+		"resources": map[string]interface{}{
+			"requests": func() map[string]interface{} {
+				m := make(map[string]interface{}, len(requests))
+				for k, v := range requests {
+					m[k] = v
+				}
+				return m
+			}(),
+		},
+	}
+	if cores > 0 {
+		domain["cpu"] = map[string]interface{}{"cores": cores}
+	}
+	if limits != nil {
+		lm := make(map[string]interface{}, len(limits))
+		for k, v := range limits {
+			lm[k] = v
+		}
+		domain["resources"].(map[string]interface{})["limits"] = lm
+	}
+	return &unstructured.Unstructured{Object: map[string]interface{}{
+		"spec": map[string]interface{}{
+			"template": map[string]interface{}{
+				"spec": map[string]interface{}{
+					"domain": domain,
+				},
+			},
+		},
+	}}
+}
+
+func TestSetVMResources(t *testing.T) {
+	t.Run("no change returns false", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, nil)
+		cfg := vmResourceConfig{
+			CPUCores: 2,
+			Requests: map[string]string{"memory": "2048Mi"},
+		}
+		changed, err := setVMResources(vm, cfg)
+		require.NoError(t, err)
+		assert.False(t, changed)
+	})
+
+	t.Run("CPU cores changed", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, nil)
+		cfg := vmResourceConfig{
+			CPUCores: 4,
+			Requests: map[string]string{"memory": "2048Mi"},
+		}
+		changed, err := setVMResources(vm, cfg)
+		require.NoError(t, err)
+		assert.True(t, changed)
+
+		cores, _, _ := unstructured.NestedInt64(vm.Object, "spec", "template", "spec", "domain", "cpu", "cores")
+		assert.Equal(t, int64(4), cores)
+	})
+
+	t.Run("memory changed", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, nil)
+		cfg := vmResourceConfig{
+			CPUCores: 2,
+			Requests: map[string]string{"memory": "4Gi"},
+		}
+		changed, err := setVMResources(vm, cfg)
+		require.NoError(t, err)
+		assert.True(t, changed)
+
+		mem, _, _ := unstructured.NestedString(vm.Object, "spec", "template", "spec", "domain", "resources", "requests", "memory")
+		assert.Equal(t, "4Gi", mem)
+	})
+
+	t.Run("integer to fractional CPU", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, nil)
+		cfg := vmResourceConfig{
+			CPUCores: 0,
+			Requests: map[string]string{"memory": "2048Mi", "cpu": "500m"},
+		}
+		changed, err := setVMResources(vm, cfg)
+		require.NoError(t, err)
+		assert.True(t, changed)
+
+		_, cpuFound, _ := unstructured.NestedInt64(vm.Object, "spec", "template", "spec", "domain", "cpu", "cores")
+		assert.False(t, cpuFound, "domain.cpu should be removed for fractional CPU")
+
+		cpuReq, _, _ := unstructured.NestedString(vm.Object, "spec", "template", "spec", "domain", "resources", "requests", "cpu")
+		assert.Equal(t, "500m", cpuReq)
+	})
+
+	t.Run("limits added", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, nil)
+		cfg := vmResourceConfig{
+			CPUCores: 2,
+			Requests: map[string]string{"memory": "2048Mi"},
+			Limits:   map[string]string{"cpu": "4", "memory": "8Gi"},
+		}
+		changed, err := setVMResources(vm, cfg)
+		require.NoError(t, err)
+		assert.True(t, changed)
+
+		limits, found, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
+		require.True(t, found)
+		assert.Equal(t, "4", limits["cpu"])
+		assert.Equal(t, "8Gi", limits["memory"])
+	})
+
+	t.Run("limits removed", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, map[string]string{"cpu": "4"})
+		cfg := vmResourceConfig{
+			CPUCores: 2,
+			Requests: map[string]string{"memory": "2048Mi"},
+			Limits:   nil,
+		}
+		changed, err := setVMResources(vm, cfg)
+		require.NoError(t, err)
+		assert.True(t, changed)
+
+		_, found, _ := unstructured.NestedStringMap(vm.Object, "spec", "template", "spec", "domain", "resources", "limits")
+		assert.False(t, found, "limits should be removed")
+	})
+}
+
+func TestVMResourcesNeedSync(t *testing.T) {
+	t.Run("in sync returns false", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, nil)
+		cfg := vmResourceConfig{CPUCores: 2, Requests: map[string]string{"memory": "2048Mi"}}
+		assert.False(t, vmResourcesNeedSync(vm, cfg))
+	})
+
+	t.Run("different cores returns true", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, nil)
+		cfg := vmResourceConfig{CPUCores: 4, Requests: map[string]string{"memory": "2048Mi"}}
+		assert.True(t, vmResourcesNeedSync(vm, cfg))
+	})
+
+	t.Run("stale limits returns true", func(t *testing.T) {
+		vm := buildTestVM(2, map[string]string{"memory": "2048Mi"}, map[string]string{"cpu": "4"})
+		cfg := vmResourceConfig{CPUCores: 2, Requests: map[string]string{"memory": "2048Mi"}}
+		assert.True(t, vmResourcesNeedSync(vm, cfg))
+	})
+}
+
 func TestVMContainerDiskImageHelpers(t *testing.T) {
 	vm := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "kubevirt.io/v1",

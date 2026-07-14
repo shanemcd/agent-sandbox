@@ -336,6 +336,9 @@ func (r *SandboxReconciler) reconcileVirtualMachine(ctx context.Context, sandbox
 	if _, err := r.syncVMContainerDiskImage(ctx, sandbox, vm); err != nil {
 		return ctrl.Result{}, err
 	}
+	if _, err := r.syncVMResources(ctx, sandbox, vm); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	running, _, _ := unstructured.NestedBool(vm.Object, "spec", "running")
 	if !running {
@@ -374,6 +377,122 @@ func (r *SandboxReconciler) syncVMContainerDiskImage(ctx context.Context, sandbo
 	logger.Info("Updated VirtualMachine containerDisk image",
 		"VM.Name", vm.GetName(), "from", current, "to", desired)
 	return true, nil
+}
+
+// syncVMResources patches the existing VM when the Sandbox container resource
+// requirements differ from the VM domain CPU/memory. Does not restart the VMI.
+func (r *SandboxReconciler) syncVMResources(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, vm *unstructured.Unstructured) (bool, error) {
+	logger := log.FromContext(ctx)
+	desired := vmContainerResources(sandbox)
+
+	if !vmResourcesNeedSync(vm, desired) {
+		return false, nil
+	}
+
+	patch := client.MergeFrom(vm.DeepCopy())
+	if _, err := setVMResources(vm, desired); err != nil {
+		return false, err
+	}
+	if err := r.Patch(ctx, vm, patch); err != nil {
+		return false, fmt.Errorf("failed to patch VirtualMachine resources: %w", err)
+	}
+	logger.Info("Updated VirtualMachine domain resources", "VM.Name", vm.GetName())
+	return true, nil
+}
+
+// vmResourcesNeedSync returns true when the VM domain resources differ from
+// the desired config.
+func vmResourcesNeedSync(vm *unstructured.Unstructured, cfg vmResourceConfig) bool {
+	domainPath := []string{"spec", "template", "spec", "domain"}
+
+	currentCores, _, _ := unstructured.NestedInt64(vm.Object, append(domainPath, "cpu", "cores")...)
+	if cfg.CPUCores > 0 && currentCores != cfg.CPUCores {
+		return true
+	}
+	if cfg.CPUCores == 0 && currentCores != 0 {
+		return true
+	}
+
+	currentRequests, _, _ := unstructured.NestedStringMap(vm.Object, append(domainPath, "resources", "requests")...)
+	if !stringMapsEqual(currentRequests, cfg.Requests) {
+		return true
+	}
+
+	currentLimits, limitsFound, _ := unstructured.NestedStringMap(vm.Object, append(domainPath, "resources", "limits")...)
+	if cfg.Limits != nil && !stringMapsEqual(currentLimits, cfg.Limits) {
+		return true
+	}
+	if cfg.Limits == nil && limitsFound {
+		return true
+	}
+
+	return false
+}
+
+// setVMResources mutates the VM unstructured object to match the desired
+// resource config. Returns true if any field was changed.
+func setVMResources(vm *unstructured.Unstructured, cfg vmResourceConfig) (bool, error) {
+	domainPath := []string{"spec", "template", "spec", "domain"}
+	changed := false
+
+	// CPU cores
+	currentCores, _, _ := unstructured.NestedInt64(vm.Object, append(domainPath, "cpu", "cores")...)
+	if cfg.CPUCores > 0 {
+		if currentCores != cfg.CPUCores {
+			if err := unstructured.SetNestedField(vm.Object, cfg.CPUCores, append(domainPath, "cpu", "cores")...); err != nil {
+				return false, fmt.Errorf("set domain.cpu.cores: %w", err)
+			}
+			changed = true
+		}
+	} else if currentCores != 0 {
+		unstructured.RemoveNestedField(vm.Object, append(domainPath, "cpu")...)
+		changed = true
+	}
+
+	// Requests
+	currentRequests, _, _ := unstructured.NestedStringMap(vm.Object, append(domainPath, "resources", "requests")...)
+	if !stringMapsEqual(currentRequests, cfg.Requests) {
+		reqIface := make(map[string]interface{}, len(cfg.Requests))
+		for k, v := range cfg.Requests {
+			reqIface[k] = v
+		}
+		if err := unstructured.SetNestedField(vm.Object, reqIface, append(domainPath, "resources", "requests")...); err != nil {
+			return false, fmt.Errorf("set domain.resources.requests: %w", err)
+		}
+		changed = true
+	}
+
+	// Limits
+	currentLimits, limitsFound, _ := unstructured.NestedStringMap(vm.Object, append(domainPath, "resources", "limits")...)
+	if cfg.Limits != nil {
+		if !stringMapsEqual(currentLimits, cfg.Limits) {
+			limIface := make(map[string]interface{}, len(cfg.Limits))
+			for k, v := range cfg.Limits {
+				limIface[k] = v
+			}
+			if err := unstructured.SetNestedField(vm.Object, limIface, append(domainPath, "resources", "limits")...); err != nil {
+				return false, fmt.Errorf("set domain.resources.limits: %w", err)
+			}
+			changed = true
+		}
+	} else if limitsFound {
+		unstructured.RemoveNestedField(vm.Object, append(domainPath, "resources", "limits")...)
+		changed = true
+	}
+
+	return changed, nil
+}
+
+func stringMapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
 }
 
 // vmContainerDiskImage returns the containerDisk.image for the volume named
