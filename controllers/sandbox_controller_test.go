@@ -4205,7 +4205,8 @@ func TestReconcileChildResourcesSuspendedForeignPodDoesNotLeakIPOrNodeName(t *te
 	}
 
 	// Refusing to delete a foreign pod is a steady state, not an error.
-	require.NoError(t, r.reconcileChildResources(t.Context(), sandboxObj))
+	_, err := r.reconcileChildResources(t.Context(), sandboxObj)
+	require.NoError(t, err)
 
 	assert.Nil(t, sandboxObj.Status.PodIPs, "foreign pod IPs must NOT leak into sandbox status")
 	assert.Empty(t, sandboxObj.Status.NodeName, "foreign pod NodeName must NOT leak into sandbox status")
