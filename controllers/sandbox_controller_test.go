@@ -3380,7 +3380,8 @@ func TestReconcileChildResourcesSurfacesMultipleOwnedPods(t *testing.T) {
 		ClusterDomain: "cluster.local",
 	}
 
-	require.NoError(t, r.reconcileChildResources(t.Context(), sandbox, nil))
+	_, err := r.reconcileChildResources(t.Context(), sandbox, nil)
+	require.NoError(t, err)
 	ready := meta.FindStatusCondition(sandbox.Status.Conditions, string(sandboxv1beta1.SandboxConditionReady))
 	require.NotNil(t, ready)
 	assert.Equal(t, metav1.ConditionFalse, ready.Status)
@@ -3390,7 +3391,7 @@ func TestReconcileChildResourcesSurfacesMultipleOwnedPods(t *testing.T) {
 	assert.Empty(t, sandbox.Status.NodeName)
 
 	service := &corev1.Service{}
-	err := r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, service)
+	err = r.Get(t.Context(), types.NamespacedName{Name: sandboxName, Namespace: sandboxNs}, service)
 	require.True(t, k8serrors.IsNotFound(err), "must not create a routing Service for an ambiguous Pod mapping")
 
 	select {
@@ -3403,7 +3404,8 @@ func TestReconcileChildResourcesSurfacesMultipleOwnedPods(t *testing.T) {
 
 	// The conflict is watch-driven and does not return an error or emit a new
 	// Event on every reconcile while the Ready condition already reports it.
-	require.NoError(t, r.reconcileChildResources(t.Context(), sandbox, nil))
+	_, err = r.reconcileChildResources(t.Context(), sandbox, nil)
+	require.NoError(t, err)
 	select {
 	case event := <-recorder.Events:
 		t.Fatalf("unexpected duplicate Event: %s", event)
@@ -4747,7 +4749,8 @@ func TestReconcileChildResourcesSuspendedForeignPodDoesNotLeakIPOrNodeName(t *te
 	}
 
 	// Refusing to delete a foreign pod is a steady state, not an error.
-	require.NoError(t, r.reconcileChildResources(t.Context(), sandboxObj, nil))
+	_, err := r.reconcileChildResources(t.Context(), sandboxObj, nil)
+	require.NoError(t, err)
 
 	assert.Nil(t, sandboxObj.Status.PodIPs, "foreign pod IPs must NOT leak into sandbox status")
 	assert.Empty(t, sandboxObj.Status.NodeName, "foreign pod NodeName must NOT leak into sandbox status")
