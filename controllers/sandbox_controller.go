@@ -29,6 +29,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -263,6 +264,9 @@ type SandboxReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;update;patch;delete
+// KubeVirt VirtualMachine/VirtualMachineInstance RBAC lives in
+// controllers/kubevirt (optional ClusterRole agent-sandbox-controller-kubevirt).
 //+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
@@ -351,12 +355,16 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 				window: min(r.WriteBehindWindow, podMetadataFlushBound),
 			}
 		}
-		err = r.reconcileChildResources(ctx, sandbox, wd)
+		var childResult ctrl.Result
+		childResult, err = r.reconcileChildResources(ctx, sandbox, wd)
 		expiredAfterReconcile, requeueAfter := checkSandboxExpiry(sandbox, time.Now())
 		result.RequeueAfter = requeueAfter
 		if expiredAfterReconcile {
 			setSandboxExpiredCondition(sandbox)
 			result.RequeueAfter = immediateRequeueDelay
+		} else if childResult.RequeueAfter > 0 &&
+			(result.RequeueAfter == 0 || childResult.RequeueAfter < result.RequeueAfter) {
+			result.RequeueAfter = childResult.RequeueAfter
 		}
 		if wd != nil && err == nil {
 			if wd.deferred {
@@ -386,75 +394,89 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return result, err
 }
 
-func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, wd *writeDeferral) error {
+func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, wd *writeDeferral) (ctrl.Result, error) {
 	// Create a hash from the sandbox.Name and use it as label value
 	nameHash := NameHash(sandbox.Name)
 
 	var allErrors error
 	var conditionErrors error
+	result := ctrl.Result{}
 
-	// Reconcile PVCs from volumeClaimTemplates
+	// Reconcile PVCs from volumeClaimTemplates (common to both backends)
 	err := r.reconcilePVCs(ctx, sandbox, nameHash)
 	allErrors = errors.Join(allErrors, err)
 	conditionErrors = errors.Join(conditionErrors, err)
 
-	// Reconcile Pod
-	pod, podErr := r.reconcilePod(ctx, sandbox, nameHash, wd)
-	conditionErrors = errors.Join(conditionErrors, podErr)
-	podMappingConflict := isMultipleSandboxPodsError(podErr)
-	if podMappingConflict {
-		r.recordMultiplePodsEvent(sandbox, podErr)
+	// Branch based on runtime backend
+	var pod *corev1.Pod
+	var podErr error
+	var podMappingConflict bool
+	if sandbox.Spec.RuntimeBackend == sandboxv1beta1.RuntimeBackendVirtualMachine {
+		var vmResult ctrl.Result
+		vmResult, err = r.reconcileVirtualMachine(ctx, sandbox, nameHash)
+		allErrors = errors.Join(allErrors, err)
+		result = vmResult
 	} else {
-		allErrors = errors.Join(allErrors, podErr)
-	}
-
-	if pod == nil {
-		sandbox.Status.PodIPs = nil
-		sandbox.Status.NodeName = ""
-	} else {
-		sandbox.Status.LabelSelector = sandboxLabel + "=" + nameHash
-		if isOwnedBySandbox(pod, sandbox) {
-			sandbox.Status.PodIPs = podIPsFromStatus(pod.Status.PodIPs)
-			sandbox.Status.NodeName = pod.Spec.NodeName
+		// Reconcile Pod
+		pod, podErr = r.reconcilePod(ctx, sandbox, nameHash, wd)
+		conditionErrors = errors.Join(conditionErrors, podErr)
+		podMappingConflict = isMultipleSandboxPodsError(podErr)
+		if podMappingConflict {
+			r.recordMultiplePodsEvent(sandbox, podErr)
 		} else {
+			allErrors = errors.Join(allErrors, podErr)
+		}
+
+		if pod == nil {
 			sandbox.Status.PodIPs = nil
 			sandbox.Status.NodeName = ""
+		} else {
+			sandbox.Status.LabelSelector = sandboxLabel + "=" + nameHash
+			if isOwnedBySandbox(pod, sandbox) {
+				sandbox.Status.PodIPs = podIPsFromStatus(pod.Status.PodIPs)
+				sandbox.Status.NodeName = pod.Spec.NodeName
+			} else {
+				sandbox.Status.PodIPs = nil
+				sandbox.Status.NodeName = ""
+			}
 		}
 	}
 
 	// Do not create or modify a routing Service while the backing Pod mapping is
 	// ambiguous. Existing Services are left untouched for an operator to inspect.
 	var svc *corev1.Service
-	if !podMappingConflict {
+	if !podMappingConflict && sandbox.Spec.RuntimeBackend != sandboxv1beta1.RuntimeBackendVirtualMachine {
 		svc, err = r.reconcileService(ctx, sandbox, nameHash)
 		allErrors = errors.Join(allErrors, err)
 		conditionErrors = errors.Join(conditionErrors, err)
 	}
 
-	// compute and set overall conditions
-	conditions := r.computeConditions(sandbox, conditionErrors, svc, pod, podErr)
-	// Conditions that are only present while they apply: Finished has no
-	// meaning without a terminal pod, PodScheduled none without a pod at
-	// all. Any of these not computed this pass is removed from status.
-	// Suspended is deliberately NOT in this set: it is persistent and
-	// transitions to False rather than being removed (see #1150).
-	presentWhileApplicable := map[string]bool{
-		string(sandboxv1beta1.SandboxConditionFinished):     false,
-		string(sandboxv1beta1.SandboxConditionPodScheduled): false,
-	}
-	for _, condition := range conditions {
-		meta.SetStatusCondition(&sandbox.Status.Conditions, condition)
-		if _, ok := presentWhileApplicable[condition.Type]; ok {
-			presentWhileApplicable[condition.Type] = true
+	// compute and set overall conditions (Pod backend only; VM backend sets its own)
+	if sandbox.Spec.RuntimeBackend != sandboxv1beta1.RuntimeBackendVirtualMachine {
+		conditions := r.computeConditions(sandbox, conditionErrors, svc, pod, podErr)
+		// Conditions that are only present while they apply: Finished has no
+		// meaning without a terminal pod, PodScheduled none without a pod at
+		// all. Any of these not computed this pass is removed from status.
+		// Suspended is deliberately NOT in this set: it is persistent and
+		// transitions to False rather than being removed (see #1150).
+		presentWhileApplicable := map[string]bool{
+			string(sandboxv1beta1.SandboxConditionFinished):     false,
+			string(sandboxv1beta1.SandboxConditionPodScheduled): false,
 		}
-	}
-	for condType, present := range presentWhileApplicable {
-		if !present {
-			meta.RemoveStatusCondition(&sandbox.Status.Conditions, condType)
+		for _, condition := range conditions {
+			meta.SetStatusCondition(&sandbox.Status.Conditions, condition)
+			if _, ok := presentWhileApplicable[condition.Type]; ok {
+				presentWhileApplicable[condition.Type] = true
+			}
+		}
+		for condType, present := range presentWhileApplicable {
+			if !present {
+				meta.RemoveStatusCondition(&sandbox.Status.Conditions, condType)
+			}
 		}
 	}
 
-	return allErrors
+	return result, allErrors
 }
 
 func (r *SandboxReconciler) recordMultiplePodsEvent(sandbox *sandboxv1beta1.Sandbox, err error) {
@@ -1850,10 +1872,16 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 		return err
 	}
 
+	// Unstructured prototype for VirtualMachine watches
+	vmProto := &unstructured.Unstructured{}
+	vmProto.SetGroupVersionKind(kubevirtVMGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1beta1.Sandbox{}).
 		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
+		Owns(&corev1.Secret{}, builder.WithPredicates(labelSelectorPredicate)).
+		Owns(vmProto, builder.WithPredicates(labelSelectorPredicate)).
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
 		Complete(r)
 }

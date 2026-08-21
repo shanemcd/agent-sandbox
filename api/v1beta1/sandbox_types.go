@@ -235,6 +235,17 @@ const (
 	SandboxOperatingModeSuspended SandboxOperatingMode = "Suspended"
 )
 
+// RuntimeBackend defines which compute backend the controller uses for the sandbox workload.
+// +kubebuilder:validation:Enum=Pod;VirtualMachine
+type RuntimeBackend string
+
+const (
+	// RuntimeBackendPod provisions the sandbox as a Kubernetes Pod (default).
+	RuntimeBackendPod RuntimeBackend = "Pod"
+	// RuntimeBackendVirtualMachine provisions the sandbox as a KubeVirt VirtualMachine.
+	RuntimeBackendVirtualMachine RuntimeBackend = "VirtualMachine"
+)
+
 // NOTE: When adding, removing, or renaming a field in SandboxBlueprint,
 // also update compareSandboxBlueprint() in extensions/controllers/sandboxwarmpool_controller.go
 // so the SandboxWarmPool staleness check accounts for it. A field left out of that comparison
@@ -266,6 +277,16 @@ type SandboxBlueprint struct {
 	//nolint:kubeapilinter // Enum not used to avoid duplicating the Service API; field is not expected to extend (issue #746).
 	// +optional
 	Service *bool `json:"service,omitempty"`
+
+	// runtimeBackend selects the compute backend for the sandbox workload.
+	// "Pod" (default) creates a standard Kubernetes Pod.
+	// "VirtualMachine" creates a KubeVirt VirtualMachine, using the first
+	// container image from podTemplate as the containerDisk source.
+	// Requires KubeVirt to be installed on the cluster.
+	// +kubebuilder:default=Pod
+	// +kubebuilder:validation:Enum=Pod;VirtualMachine
+	// +optional
+	RuntimeBackend RuntimeBackend `json:"runtimeBackend,omitempty"`
 }
 
 // SandboxSpec defines the desired state of Sandbox.

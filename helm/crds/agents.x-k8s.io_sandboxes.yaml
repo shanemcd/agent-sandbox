@@ -3961,6 +3961,18 @@ spec:
                 required:
                 - spec
                 type: object
+              runtimeBackend:
+                default: Pod
+                description: |-
+                  runtimeBackend selects the compute backend for the sandbox workload.
+                  "Pod" (default) creates a standard Kubernetes Pod.
+                  "VirtualMachine" creates a KubeVirt VirtualMachine, using the first
+                  container image from podTemplate as the containerDisk source.
+                  Requires KubeVirt to be installed on the cluster.
+                enum:
+                - Pod
+                - VirtualMachine
+                type: string
               service:
                 type: boolean
               shutdownPolicy:
